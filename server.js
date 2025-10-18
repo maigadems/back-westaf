@@ -33,7 +33,7 @@ if (!PAYTECH_API_KEY || !PAYTECH_API_SECRET) {
 // === Middlewares ===
 app.use(helmet());
 app.use(cors({
-  origin: ["http://localhost:3000", "https://harmonious-florentine-0eff6a.netlify.app"],
+  origin: ["https://westafrecords.com", "https://harmonious-florentine-0eff6a.netlify.app"],
   credentials: true
 }));
 app.use(express.json());
