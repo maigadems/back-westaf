@@ -1,6 +1,5 @@
 // === server.js ===
-// Backend d'intégration PayTech conforme à la documentation officielle
-// Documentation : https://docs.intech.sn/doc_paytech.php
+// Backend d'intégration PayTech avec création de réservation après paiement
 
 import express from "express";
 import axios from "axios";
@@ -9,7 +8,7 @@ import dotenv from "dotenv";
 import helmet from "helmet";
 import morgan from "morgan";
 import crypto from "crypto";
-
+import { createReservation, checkDuplicateReservation } from "./services/reservationService.js";
 
 // Charger les variables d'environnement
 dotenv.config();
@@ -18,11 +17,11 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// === Configuration PayTech (selon documentation) ===
+// === Configuration PayTech ===
 const PAYTECH_BASE_URL = process.env.PAYTECH_BASE_URL || "https://paytech.sn/api";
 const PAYTECH_API_KEY = process.env.PAYTECH_API_KEY;
-const PAYTECH_API_SECRET = process.env.PAYTECH_API_SECRET; // ⚠️ Nom corrigé
-const PAYTECH_ENV = process.env.PAYTECH_ENV || "prod"; // "test" ou "prod"
+const PAYTECH_API_SECRET = process.env.PAYTECH_API_SECRET;
+const PAYTECH_ENV = process.env.PAYTECH_ENV || "prod";
 
 // === Vérification des variables essentielles ===
 if (!PAYTECH_API_KEY || !PAYTECH_API_SECRET) {
@@ -37,20 +36,20 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // Pour traiter les IPN
+app.use(express.urlencoded({ extended: true }));
 app.use(morgan("dev"));
 
-// === Headers PayTech (selon documentation) ===
+// === Headers PayTech ===
 function paytechHeaders() {
   return {
     "Accept": "application/json",
     "Content-Type": "application/json",
-    "API_KEY": PAYTECH_API_KEY,        // ⚠️ Format header corrigé
-    "API_SECRET": PAYTECH_API_SECRET   // ⚠️ Format header corrigé
+    "API_KEY": PAYTECH_API_KEY,
+    "API_SECRET": PAYTECH_API_SECRET
   };
 }
 
-// === [1] Créer une requête de paiement (conforme à la doc) ===
+// === [1] Créer une requête de paiement ===
 app.post("/create-payment", async (req, res) => {
   try {
     const { 
@@ -59,9 +58,10 @@ app.post("/create-payment", async (req, res) => {
       name,
       description, 
       target_payment,
-      user_phone,      // Nouveau : pour auto-fill
-      user_firstname,  // Nouveau : pour auto-fill
-      user_lastname    // Nouveau : pour auto-fill
+      user_phone,
+      user_firstname,
+      user_lastname,
+      reservationData // ✅ NOUVEAU: Données de réservation
     } = req.body;
 
     // Validation
@@ -72,11 +72,28 @@ app.post("/create-payment", async (req, res) => {
       });
     }
 
+    // ✅ Validation des données de réservation
+    if (!reservationData || !reservationData.nom || !reservationData.email) {
+      return res.status(400).json({
+        error: true,
+        message: "Données de réservation manquantes"
+      });
+    }
+
     const ref_command = `CMD_${Date.now()}`;
     const whatsappNumber = "221710162323";
     const whatsappMessage = `✅ Bonjour, je confirme ma réservation pour le ${encodeURIComponent(date)}.\n💰 Montant payé : ${amount} XOF\n👤 Nom : ${encodeURIComponent(name)}`;
-    const whatsappUrl = `https://wa.me/${whatsappNumber}?text=${encodeURIComponent(whatsappMessage)}`;
-    // Payload selon documentation PayTech
+    const whatsappUrl = `https://wa.me/${whatsappNumber}?text=${whatsappMessage}`;
+
+    // ✅ Encoder les données de réservation dans custom_field
+    const customFieldData = {
+      order_id: ref_command,
+      timestamp: Date.now(),
+      note: "Paiement Westaf Records",
+      reservationData: reservationData // ✅ Inclure toutes les données de réservation
+    };
+
+    // Payload PayTech
     const payload = {
       item_name: description || "Commande boutique Westaf Records",
       item_price: Number(amount),
@@ -87,24 +104,18 @@ app.post("/create-payment", async (req, res) => {
       ipn_url: process.env.PAYTECH_IPN_URL,
       success_url: whatsappUrl,
       cancel_url: process.env.PAYTECH_CANCEL_URL,
-      custom_field: JSON.stringify({ 
-        order_id: ref_command,
-        timestamp: Date.now(),
-        note: "Paiement Westaf Records" 
-      })
+      custom_field: JSON.stringify(customFieldData) // ✅ Données encodées
     };
 
-    // Ajouter target_payment si spécifié (voir doc: méthodes de paiement ciblées)
     if (target_payment) {
-      payload.target_payment = target_payment; // ex: "Wave", "Orange Money"
+      payload.target_payment = target_payment;
     }
 
-    // Ajouter refund_notif_url si défini
     if (process.env.PAYTECH_REFUND_NOTIF_URL) {
       payload.refund_notif_url = process.env.PAYTECH_REFUND_NOTIF_URL;
     }
 
-    console.log("📤 Envoi requête PayTech:", payload);
+    console.log("📤 Envoi requête PayTech avec données de réservation");
 
     const response = await axios.post(
       `${PAYTECH_BASE_URL}/payment/request-payment`,
@@ -118,7 +129,6 @@ app.post("/create-payment", async (req, res) => {
     const data = response.data;
     console.log("📥 Réponse PayTech:", data);
 
-    // Structure de réponse selon doc: { success: 1, token: "...", redirect_url: "..." }
     if (data.success !== 1 || !data.redirect_url) {
       return res.status(502).json({
         error: true,
@@ -129,7 +139,7 @@ app.post("/create-payment", async (req, res) => {
 
     let redirectUrl = data.redirect_url;
 
-    // Auto-fill si méthode unique et infos utilisateur fournies (selon doc)
+    // Auto-fill si nécessaire
     if (target_payment && 
         !target_payment.includes(',') && 
         user_phone && 
@@ -137,11 +147,11 @@ app.post("/create-payment", async (req, res) => {
         user_lastname) {
       
       const queryParams = new URLSearchParams({
-        'pn': user_phone,                                    // +221777777777
+        'pn': user_phone,
         'nn': user_phone.startsWith('+221') ? user_phone.slice(4) : user_phone,
-        'fn': `${user_firstname} ${user_lastname}`,         // Nom complet
-        'tp': target_payment,                               // Même valeur que target_payment
-        'nac': target_payment === 'Carte Bancaire' ? '0' : '1' // Auto-submit
+        'fn': `${user_firstname} ${user_lastname}`,
+        'tp': target_payment,
+        'nac': target_payment === 'Carte Bancaire' ? '0' : '1'
       });
 
       redirectUrl += '?' + queryParams.toString();
@@ -165,7 +175,7 @@ app.post("/create-payment", async (req, res) => {
   }
 });
 
-// === [2] Réception IPN (Webhook PayTech) - Sécurisé selon doc ===
+// === [2] Réception IPN (Webhook PayTech) - AVEC CRÉATION DE RÉSERVATION ===
 app.post("/ipn", async (req, res) => {
   try {
     console.log("📩 IPN reçu:", req.body);
@@ -188,7 +198,7 @@ app.post("/ipn", async (req, res) => {
       hmac_compute
     } = req.body;
 
-    // === MÉTHODE 1: Vérification HMAC-SHA256 (Recommandée par la doc) ===
+    // === Vérification HMAC-SHA256 ===
     if (hmac_compute) {
       const message = `${final_item_price || item_price}|${ref_command}|${PAYTECH_API_KEY}`;
       const expectedHmac = crypto
@@ -202,7 +212,7 @@ app.post("/ipn", async (req, res) => {
       }
       console.log("✅ IPN authentifié via HMAC");
     } 
-    // === MÉTHODE 2: Vérification SHA256 (Alternative) ===
+    // === Vérification SHA256 ===
     else if (api_key_sha256 && api_secret_sha256) {
       const expectedApiKey = crypto
         .createHash('sha256')
@@ -225,16 +235,26 @@ app.post("/ipn", async (req, res) => {
       return res.status(403).json({ success: 0, message: "Vérification impossible" });
     }
 
-    // Décoder custom_field depuis Base64 (selon doc)
+    // ✅ Décoder custom_field
     let customData = {};
+    let reservationData = null;
+    
     try {
-      const decodedCustomField = Buffer.from(custom_field, 'base64').toString('utf-8');
-      customData = JSON.parse(decodedCustomField);
+      // Essayer de parser directement (si JSON)
+      customData = JSON.parse(custom_field);
+      reservationData = customData.reservationData;
     } catch (e) {
-      console.log("⚠️ Custom field non-JSON ou non encodé:", custom_field);
+      // Sinon, essayer de décoder depuis Base64
+      try {
+        const decodedCustomField = Buffer.from(custom_field, 'base64').toString('utf-8');
+        customData = JSON.parse(decodedCustomField);
+        reservationData = customData.reservationData;
+      } catch (e2) {
+        console.log("⚠️ Custom field non-JSON ou non encodé:", custom_field);
+      }
     }
 
-    // Traitement selon type d'événement
+    // === Traitement selon type d'événement ===
     if (type_event === 'sale_complete') {
       console.log(`✅ Paiement réussi pour ${ref_command}`);
       console.log(`💰 Montant: ${final_item_price || item_price} XOF`);
@@ -246,24 +266,38 @@ app.post("/ipn", async (req, res) => {
         console.log(`   Prix initial: ${initial_item_price} XOF → Prix final: ${final_item_price} XOF`);
       }
 
-      // TODO: Mettre à jour votre base de données
-      // updateOrderStatus(ref_command, 'paid', {
-      //   finalPrice: final_item_price,
-      //   paymentMethod: payment_method,
-      //   customData: customData
-      // });
+      // ✅ CRÉER LA RÉSERVATION DANS SUPABASE
+      if (reservationData) {
+        console.log('🎯 Création de la réservation après paiement confirmé...');
+        
+        // Vérifier les doublons
+        const isDuplicate = await checkDuplicateReservation(
+          reservationData.email,
+          reservationData.date_reservation,
+          reservationData.type_service
+        );
 
-      // TODO: Envoyer email de confirmation
-      // sendConfirmationEmail(customData.email);
+        if (isDuplicate) {
+          console.log('⚠️ Réservation déjà existante, doublon évité');
+        } else {
+          const result = await createReservation(reservationData);
+          
+          if (result.success) {
+            console.log('✅ Réservation créée avec succès:', result.data.id);
+          } else {
+            console.error('❌ Échec de la création de la réservation:', result.error);
+          }
+        }
+      } else {
+        console.error('❌ Aucune donnée de réservation trouvée dans custom_field');
+      }
 
     } else if (type_event === 'sale_canceled') {
       console.log(`❌ Paiement annulé pour ${ref_command}`);
-      
-      // TODO: Mettre à jour votre base de données
-      // updateOrderStatus(ref_command, 'canceled');
+      console.log('ℹ️ Aucune réservation ne sera créée');
     }
 
-    // Réponse obligatoire selon doc
+    // Réponse obligatoire
     res.status(200).json({ success: 1, message: "IPN traité avec succès" });
 
   } catch (err) {
@@ -342,7 +376,7 @@ app.post("/refund", async (req, res) => {
   }
 });
 
-// === [5] Route de test (sanity check) ===
+// === [5] Route de test ===
 app.get("/health", (req, res) => {
   res.json({
     status: "OK",
@@ -378,5 +412,5 @@ app.listen(PORT, () => {
   console.log("  GET  /payment-status      → Vérifier statut paiement");
   console.log("  POST /refund              → Rembourser un paiement");
   console.log("  GET  /health              → Vérifier l'état du serveur");
-  console.log("\n⚠️  N'oubliez pas de configurer vos URLs IPN en HTTPS!\n");
+  console.log("\n✅ Réservations créées automatiquement après paiement confirmé!\n");
 });
