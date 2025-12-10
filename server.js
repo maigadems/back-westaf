@@ -82,8 +82,11 @@ app.post("/create-payment", async (req, res) => {
 
     const ref_command = `CMD_${Date.now()}`;
     const whatsappNumber = "221710162323";
-    const whatsappMessage = `✅ Bonjour, je confirme ma réservation pour le ${encodeURIComponent(date)}.\n💰 Montant payé : ${amount} XOF\n👤 Nom : ${encodeURIComponent(name)}`;
-    const whatsappUrl = `https://wa.me/${whatsappNumber}?text=${whatsappMessage}`;
+    // Construire le message WhatsApp sans emojis problématiques
+    const whatsappMessage = `Bonjour, je confirme ma reservation pour le ${date}. Montant paye : ${amount} XOF. Nom : ${name}`;
+    // Encoder correctement pour WhatsApp
+    const whatsappUrl = `https://wa.me/${whatsappNumber}?text=${encodeURIComponent(whatsappMessage)}`;
+
 
     // ✅ Encoder les données de réservation dans custom_field
     const customFieldData = {
