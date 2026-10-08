@@ -95,7 +95,7 @@ app.post("/create-payment", async (req, res) => {
     }
 
     const ref_command = `CMD_${Date.now()}`;
-    const whatsappNumber = "221710162323";
+    const whatsappNumber = "221778600482";
     // Construire le message WhatsApp sans emojis problématiques
     const whatsappMessage = `Bonjour, je confirme ma reservation pour le ${date}. Montant paye : ${amount} XOF. Nom : ${name}`;
     // Encoder correctement pour WhatsApp
