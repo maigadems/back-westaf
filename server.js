@@ -119,6 +119,8 @@ app.post("/create-payment", async (req, res) => {
     // Résumé compact renvoyé dans l'URL de retour pour le message WhatsApp
     const summary = {
       nom: reservationData.nom,
+      email: reservationData.email,
+      message: reservationData.message ? String(reservationData.message).slice(0, 200) : undefined,
       telephone: reservationData.telephone,
       type_service: reservationData.type_service,
       selectedDateFormatted: reservationData.selectedDateFormatted,
@@ -557,7 +559,7 @@ app.post("/client/login", async (req, res) => {
     const client = telephone ? await findClient(telephone) : null;
     if (client && verifyPassword(password, client.password_hash)) {
       clearFailures(rlKey);
-      return res.json({ token: signClientToken(telephone), telephone, nom: client.nom });
+      return res.json({ token: signClientToken(telephone), telephone, nom: client.nom, mustChange: !!client.must_change_password });
     }
     recordFailure(rlKey);
     res.status(401).json({ error: true, message: "Numéro ou mot de passe incorrect" });
@@ -574,6 +576,7 @@ app.get("/client/me", requireClient, async (req, res) => {
     res.json({
       telephone: client.telephone,
       nom: client.nom,
+      mustChange: !!client.must_change_password,
       reservations: await getClientReservations(req.clientPhone)
     });
   } catch (err) {
@@ -584,6 +587,9 @@ app.get("/client/me", requireClient, async (req, res) => {
 
 app.post("/client/password", requireClient, async (req, res) => {
   const { oldPassword, newPassword } = req.body || {};
+  if (typeof newPassword === "string" && newPassword === oldPassword) {
+    return res.status(400).json({ error: true, message: "Le nouveau mot de passe doit être différent de l'actuel" });
+  }
   if (typeof newPassword !== "string" || newPassword.length < 8) {
     return res.status(400).json({ error: true, message: "Le nouveau mot de passe doit contenir au moins 8 caractères" });
   }
@@ -596,7 +602,7 @@ app.post("/client/password", requireClient, async (req, res) => {
       return res.status(403).json({ error: true, message: "Mot de passe actuel incorrect" });
     }
     clearFailures(rlKey);
-    await setPassword(req.clientPhone, newPassword);
+    await setPassword(req.clientPhone, newPassword, 0);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: true, message: "Erreur serveur" });

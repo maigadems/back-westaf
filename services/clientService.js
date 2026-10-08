@@ -44,7 +44,7 @@ export const ensureClientAccount = async (rawPhone, nom) => {
   if (existing) return { created: false, telephone };
   const password = generatePassword();
   await pool.execute(
-    'INSERT INTO clients (telephone, nom, password_hash) VALUES (?, ?, ?)',
+    'INSERT INTO clients (telephone, nom, password_hash, must_change_password) VALUES (?, ?, ?, 1)',
     [telephone, nom || null, hashPassword(password)]
   );
   return { created: true, telephone, password };
@@ -71,9 +71,10 @@ export const takeReveal = async (key) => {
   return rows[0];
 };
 
-export const setPassword = async (telephone, password) => {
-  const [r] = await pool.execute('UPDATE clients SET password_hash = ? WHERE telephone = ?', [
+export const setPassword = async (telephone, password, mustChange = 0) => {
+  const [r] = await pool.execute('UPDATE clients SET password_hash = ?, must_change_password = ? WHERE telephone = ?', [
     hashPassword(password),
+    mustChange,
     telephone
   ]);
   return r.affectedRows > 0;
@@ -81,7 +82,7 @@ export const setPassword = async (telephone, password) => {
 
 export const resetPassword = async (telephone) => {
   const password = generatePassword();
-  const ok = await setPassword(telephone, password);
+  const ok = await setPassword(telephone, password, 1);
   return ok ? password : null;
 };
 
