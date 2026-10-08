@@ -14,11 +14,15 @@ const parseRow = (row) => ({
 export const createReservation = async (d) => {
   try {
     const id = crypto.randomUUID();
+    // Acompte de 50 % uniquement pour les réservations horaires choisies en paiement partiel
+    const partiel = d.type_service === 'horaire' && d.paymentOption === 'half';
+    const typePaiement = partiel ? 'partiel' : 'total';
+    const montantPaye = partiel ? Math.ceil(d.montant_total / 2) : d.montant_total;
     await pool.execute(
       `INSERT INTO reservations
         (id, nom, email, telephone, message, date_reservation, creneaux, duree_heures,
-         montant_total, type_service, nombre_titres, statut)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmee')`,
+         montant_total, type_service, nombre_titres, type_paiement, montant_paye, statut)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmee')`,
       [
         id,
         d.nom,
@@ -30,7 +34,9 @@ export const createReservation = async (d) => {
         d.duree_heures ?? null,
         d.montant_total,
         d.type_service,
-        d.nombre_titres ?? null
+        d.nombre_titres ?? null,
+        typePaiement,
+        montantPaye
       ]
     );
     const [rows] = await pool.execute('SELECT * FROM reservations WHERE id = ?', [id]);
