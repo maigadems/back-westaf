@@ -8,7 +8,15 @@ import dotenv from "dotenv";
 import helmet from "helmet";
 import morgan from "morgan";
 import crypto from "crypto";
-import { createReservation, checkDuplicateReservation } from "./services/reservationService.js";
+import {
+  createReservation,
+  checkDuplicateReservation,
+  getAllReservations,
+  getBookedSlotsForDate,
+  getReservationStats,
+  updateReservationStatus,
+  deleteReservation
+} from "./services/reservationService.js";
 
 // Charger les variables d'environnement
 dotenv.config();
@@ -22,6 +30,7 @@ const PAYTECH_BASE_URL = process.env.PAYTECH_BASE_URL || "https://paytech.sn/api
 const PAYTECH_API_KEY = process.env.PAYTECH_API_KEY;
 const PAYTECH_API_SECRET = process.env.PAYTECH_API_SECRET;
 const PAYTECH_ENV = process.env.PAYTECH_ENV || "prod";
+const FRONTEND_URL = (process.env.FRONTEND_URL || "https://westafrecords.com").replace(/\/$/, "");
 
 // === Vérification des variables essentielles ===
 if (!PAYTECH_API_KEY || !PAYTECH_API_SECRET) {
@@ -31,9 +40,14 @@ if (!PAYTECH_API_KEY || !PAYTECH_API_SECRET) {
 
 // === Middlewares ===
 app.use(helmet());
+app.set("trust proxy", 1);
+const allowedOrigins = (process.env.CORS_ORIGINS ||
+  "https://westafrecords.com,https://harmonious-florentine-0eff6a.netlify.app")
+  .split(",").map((o) => o.trim()).filter(Boolean);
 app.use(cors({
-  origin: ["https://westafrecords.com", "https://harmonious-florentine-0eff6a.netlify.app"],
-  credentials: true
+  origin: allowedOrigins,
+  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -105,8 +119,8 @@ app.post("/create-payment", async (req, res) => {
       command_name: description || "Paiement boutique",
       env: PAYTECH_ENV,
       ipn_url: process.env.PAYTECH_IPN_URL,
-      success_url: whatsappUrl,
-      cancel_url: process.env.PAYTECH_CANCEL_URL,
+      success_url: `${FRONTEND_URL}/?payment=success&ref=${ref_command}`,
+      cancel_url: process.env.PAYTECH_CANCEL_URL || `${FRONTEND_URL}/?payment=cancel&ref=${ref_command}`,
       custom_field: JSON.stringify(customFieldData) // ✅ Données encodées
     };
 
@@ -269,7 +283,7 @@ app.post("/ipn", async (req, res) => {
         console.log(`   Prix initial: ${initial_item_price} XOF → Prix final: ${final_item_price} XOF`);
       }
 
-      // ✅ CRÉER LA RÉSERVATION DANS SUPABASE
+      // ✅ CRÉER LA RÉSERVATION DANS MYSQL
       if (reservationData) {
         console.log('🎯 Création de la réservation après paiement confirmé...');
         
@@ -376,6 +390,91 @@ app.post("/refund", async (req, res) => {
       error: true, 
       message: err.response?.data?.message || "Erreur lors du remboursement" 
     });
+  }
+});
+
+// === Réservations : routes publiques ===
+app.get("/reservations/slots", async (req, res) => {
+  const { date } = req.query;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || "")) {
+    return res.status(400).json({ error: true, message: "Date invalide" });
+  }
+  try {
+    res.json({ slots: await getBookedSlotsForDate(date) });
+  } catch (err) {
+    console.error("❌ /reservations/slots:", err.message);
+    res.status(500).json({ error: true, message: "Erreur serveur" });
+  }
+});
+
+app.get("/reservations/stats", async (req, res) => {
+  try {
+    res.json(await getReservationStats());
+  } catch (err) {
+    console.error("❌ /reservations/stats:", err.message);
+    res.status(500).json({ error: true, message: "Erreur serveur" });
+  }
+});
+
+// === Admin (authentification vérifiée côté serveur) ===
+const ADMIN_TOKEN_SECRET = process.env.ADMIN_TOKEN_SECRET;
+const signToken = (exp) =>
+  `${exp}.${crypto.createHmac("sha256", ADMIN_TOKEN_SECRET).update(String(exp)).digest("hex")}`;
+
+const safeEqual = (a, b) => {
+  const ha = crypto.createHash("sha256").update(String(a)).digest();
+  const hb = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+};
+
+const requireAdmin = (req, res, next) => {
+  const token = (req.headers.authorization || "").replace(/^Bearer /, "");
+  const [exp, sig] = token.split(".");
+  if (ADMIN_TOKEN_SECRET && exp && sig && Number(exp) > Date.now() && safeEqual(token, signToken(exp))) {
+    return next();
+  }
+  res.status(401).json({ error: true, message: "Non autorisé" });
+};
+
+app.post("/admin/login", (req, res) => {
+  const { login, password } = req.body || {};
+  if (!ADMIN_TOKEN_SECRET || !process.env.ADMIN_LOGIN || !process.env.ADMIN_PASSWORD) {
+    return res.status(500).json({ error: true, message: "Admin non configuré" });
+  }
+  if (safeEqual(login, process.env.ADMIN_LOGIN) && safeEqual(password, process.env.ADMIN_PASSWORD)) {
+    return res.json({ token: signToken(Date.now() + 8 * 60 * 60 * 1000) });
+  }
+  res.status(401).json({ error: true, message: "Identifiants incorrects" });
+});
+
+app.get("/admin/reservations", requireAdmin, async (req, res) => {
+  try {
+    res.json({ reservations: await getAllReservations() });
+  } catch (err) {
+    console.error("❌ /admin/reservations:", err.message);
+    res.status(500).json({ error: true, message: "Erreur serveur" });
+  }
+});
+
+app.patch("/admin/reservations/:id", requireAdmin, async (req, res) => {
+  const { statut } = req.body || {};
+  if (!["en_attente", "confirmee", "annulee"].includes(statut)) {
+    return res.status(400).json({ error: true, message: "Statut invalide" });
+  }
+  try {
+    const ok = await updateReservationStatus(req.params.id, statut);
+    res.status(ok ? 200 : 404).json({ success: ok });
+  } catch (err) {
+    res.status(500).json({ error: true, message: "Erreur serveur" });
+  }
+});
+
+app.delete("/admin/reservations/:id", requireAdmin, async (req, res) => {
+  try {
+    const ok = await deleteReservation(req.params.id);
+    res.status(ok ? 200 : 404).json({ success: ok });
+  } catch (err) {
+    res.status(500).json({ error: true, message: "Erreur serveur" });
   }
 });
 
