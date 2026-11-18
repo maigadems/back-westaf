@@ -1,2 +1,9 @@
 node_modules
 .env
+uploads/*
+!uploads/.gitkeep
+test/.db.json
+test/db.log
+test/.uploads/
+test/*.log
+test/.db*.json

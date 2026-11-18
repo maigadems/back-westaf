@@ -1,0 +1,166 @@
+// Paiements PayTech : acompte / total à la réservation, solde avant la session.
+import axios from 'axios';
+import crypto from 'crypto';
+import { q, one, pool } from '../config/db.js';
+import { config, paytechConfigured } from '../config/env.js';
+import { HttpError, badRequest } from '../lib/http.js';
+import { legacySlotsToRange, hoursBetween, rangeToLegacySlots } from '../lib/time.js';
+import { intlPhone } from '../lib/phone.js';
+import { confirmBalancePayment, confirmInitialPayment, getReservation } from './reservationService.js';
+import { logHistory } from './historyService.js';
+import * as notify from './notifier.js';
+import { issueAfterPayment } from './invoiceService.js';
+
+const headers = () => ({
+  Accept: 'application/json',
+  'Content-Type': 'application/json',
+  API_KEY: config.paytech.apiKey,
+  API_SECRET: config.paytech.apiSecret
+});
+
+const ipnUrl = () => config.paytech.ipnUrl || (config.publicApiUrl ? `${config.publicApiUrl}/ipn` : '');
+
+/**
+ * Crée une demande de paiement PayTech pour une réservation.
+ * kind : 'initial' (acompte / total) ou 'balance' (solde avant session).
+ */
+export const startPaytechPayment = async (reservation, kind, amount) => {
+  if (!paytechConfigured()) throw new HttpError(503, 'Le paiement en ligne est momentanément indisponible. Contactez le studio.');
+  if (!Number.isInteger(amount) || amount <= 0) throw badRequest('Montant invalide');
+  const ref = `${kind === 'initial' ? 'RES' : 'BAL'}_${reservation.id.slice(0, 8)}_${Date.now()}`;
+  await q("INSERT INTO payments (reservation_id, ref_command, kind, method, amount, status) VALUES (?, ?, ?, 'online', ?, 'pending')", [
+    reservation.id, ref, kind, amount
+  ]);
+  const ret = `${config.frontendUrl}/paiement/retour?ref=${encodeURIComponent(ref)}&r=${encodeURIComponent(reservation.id)}`;
+  const label = `${reservation.service_name}${reservation.start_at ? ` — ${reservation.start_at.slice(0, 16)}` : ''}`;
+  const payload = {
+    item_name: kind === 'initial' ? label : `Solde — ${label}`,
+    item_price: amount,
+    currency: config.paytech.currency,
+    ref_command: ref,
+    command_name: kind === 'initial' ? `Réservation ${reservation.service_name}` : `Solde réservation ${reservation.id.slice(0, 8)}`,
+    env: config.paytech.env,
+    ipn_url: ipnUrl(),
+    success_url: `${ret}&status=success`,
+    cancel_url: `${ret}&status=cancel`,
+    custom_field: JSON.stringify({ ref, reservation_id: reservation.id, kind })
+  };
+  if (config.paytech.refundNotifUrl) payload.refund_notif_url = config.paytech.refundNotifUrl;
+
+  try {
+    const { data } = await axios.post(`${config.paytech.baseUrl}/payment/request-payment`, payload, { headers: headers(), timeout: 15000 });
+    if (data.success !== 1 || !data.redirect_url) throw new Error(`Réponse PayTech inattendue : ${JSON.stringify(data).slice(0, 300)}`);
+    await q('UPDATE payments SET provider_token = ? WHERE ref_command = ?', [data.token || null, ref]);
+    return { redirectUrl: data.redirect_url, ref };
+  } catch (e) {
+    await q("UPDATE payments SET status = 'failed' WHERE ref_command = ?", [ref]);
+    console.error('❌ PayTech request-payment:', e.response?.data || e.message);
+    throw new HttpError(502, 'Impossible de créer le paiement en ligne pour le moment. Réessayez dans quelques instants.');
+  }
+};
+
+// Authentification de l'IPN (logique identique à l'ancienne intégration)
+export const verifyIpn = (b) => {
+  const { apiKey, apiSecret } = config.paytech;
+  if (!apiKey || !apiSecret) return false;
+  if (b.hmac_compute) {
+    const message = `${b.final_item_price || b.item_price}|${b.ref_command}|${apiKey}`;
+    const expected = crypto.createHmac('sha256', apiSecret).update(message).digest('hex');
+    return expected.length === String(b.hmac_compute).length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(b.hmac_compute)));
+  }
+  if (b.api_key_sha256 && b.api_secret_sha256) {
+    const k = crypto.createHash('sha256').update(apiKey).digest('hex');
+    const s = crypto.createHash('sha256').update(apiSecret).digest('hex');
+    return k === b.api_key_sha256 && s === b.api_secret_sha256;
+  }
+  return false;
+};
+
+export const handleIpn = async (b) => {
+  const payment = b.ref_command ? await one('SELECT * FROM payments WHERE ref_command = ?', [b.ref_command]) : null;
+
+  if (!payment) {
+    // Paiement initié par l'ancienne version du site (données dans custom_field)
+    return handleLegacyIpn(b);
+  }
+  if (b.type_event === 'sale_canceled') {
+    await q("UPDATE payments SET status = 'canceled' WHERE id = ? AND status = 'pending'", [payment.id]);
+    return { handled: 'canceled' };
+  }
+  if (b.type_event !== 'sale_complete') return { handled: 'ignored' };
+  if (payment.status === 'completed') return { handled: 'duplicate' };
+
+  const paidAmount = Number(b.item_price || b.final_item_price);
+  if (paidAmount !== Number(payment.amount)) {
+    console.error(`❌ IPN : montant ${paidAmount} ≠ attendu ${payment.amount} (${payment.ref_command})`);
+    await logHistory(payment.reservation_id, null, 'payment_conflict', { amount: paidAmount, expected: payment.amount, reason: 'Montant IPN inattendu' });
+  }
+  const [upd] = await pool.query(
+    "UPDATE payments SET status = 'completed', completed_at = UTC_TIMESTAMP(), provider_method = ? WHERE id = ? AND status <> 'completed'",
+    [String(b.payment_method || '').slice(0, 60) || null, payment.id]
+  );
+  if (!upd.affectedRows) return { handled: 'duplicate' };
+
+  const p = { ...payment, provider_method: b.payment_method };
+  if (payment.kind === 'initial') await confirmInitialPayment(payment.reservation_id, p);
+  else await confirmBalancePayment(payment.reservation_id, p);
+  return { handled: payment.kind };
+};
+
+// --- Compatibilité : paiements lancés avant la mise en production de la nouvelle version ---
+const handleLegacyIpn = async (b) => {
+  if (b.type_event !== 'sale_complete') return { handled: 'legacy_ignored' };
+  let data = null;
+  try { data = JSON.parse(b.custom_field); } catch {
+    try { data = JSON.parse(Buffer.from(String(b.custom_field || ''), 'base64').toString('utf-8')); } catch { data = null; }
+  }
+  const d = data?.reservationData;
+  if (!d || !d.nom || !d.email) return { handled: 'legacy_no_data' };
+
+  const dup = await one(
+    'SELECT id FROM reservations WHERE email = ? AND date_reservation = ? AND type_service = ? AND created_at >= (UTC_TIMESTAMP() - INTERVAL 5 MINUTE)',
+    [d.email, d.date_reservation, d.type_service]
+  );
+  if (dup) return { handled: 'legacy_duplicate' };
+
+  const id = crypto.randomUUID();
+  const partiel = d.type_service === 'horaire' && d.paymentOption === 'half';
+  const paid = partiel ? Math.ceil(d.montant_total / 2) : Number(d.montant_total);
+  const range = d.type_service === 'horaire' ? legacySlotsToRange(d.date_reservation, d.creneaux) : null;
+  const service = await one('SELECT id FROM services WHERE slug = ?', [{ horaire: 'enregistrement-studio', mixage: 'mixage', mastering: 'mastering' }[d.type_service] || '']);
+  const user = await one('SELECT id FROM users WHERE email = ?', [String(d.email).toLowerCase()]);
+  const ps = paid >= d.montant_total ? 'paye' : 'acompte';
+  await q(
+    `INSERT INTO reservations (id, user_id, service_id, nom, email, telephone, message, date_reservation, start_at, end_at, creneaux,
+       duree_heures, montant_total, type_paiement, montant_paye, payment_status, statut, session_status, type_service, nombre_titres, action_token)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmee', ?, ?, ?, ?)`,
+    [id, user?.id || null, service?.id || null, d.nom, d.email, intlPhone(d.telephone) || d.telephone, d.message || '', d.date_reservation,
+      range?.start || null, range?.end || null, range ? JSON.stringify(rangeToLegacySlots(range.start, range.end)) : null,
+      d.duree_heures ?? null, d.montant_total, partiel ? 'partiel' : 'total', paid, ps, ps === 'paye' && range ? 'autorisee' : 'planifiee',
+      d.type_service, d.nombre_titres ?? null, crypto.randomBytes(24).toString('hex')]
+  );
+  if (range) for (const h of hoursBetween(range.start, range.end)) await q('INSERT IGNORE INTO slot_locks (slot_start, reservation_id) VALUES (?, ?)', [h, id]);
+  await q("INSERT INTO payments (reservation_id, ref_command, kind, method, amount, status, completed_at) VALUES (?, ?, 'initial', 'online', ?, 'completed', UTC_TIMESTAMP())", [
+    id, String(b.ref_command || `LEGACY_${id}`), paid
+  ]);
+  await logHistory(id, null, 'payment_initial', { amount: paid, legacy: true });
+  await issueAfterPayment(id);
+  await notify.bookingConfirmed(await getReservation(id), paid);
+  return { handled: 'legacy_created', id };
+};
+
+export const listPayments = async ({ status, method, limit = 300 } = {}) => {
+  const where = [];
+  const params = [];
+  if (status) { where.push('p.status = ?'); params.push(status); }
+  if (method) { where.push('p.method = ?'); params.push(method); }
+  return q(
+    `SELECT p.*, r.nom, r.telephone, r.start_at, r.montant_total, r.montant_paye, r.payment_status,
+            COALESCE(s.name, r.type_service) AS service_name,
+            TRIM(CONCAT(COALESCE(v.first_name,''),' ',COALESCE(v.last_name,''))) AS validated_by_name
+     FROM payments p JOIN reservations r ON r.id = p.reservation_id
+     LEFT JOIN services s ON s.id = r.service_id LEFT JOIN users v ON v.id = p.validated_by
+     ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY p.created_at DESC LIMIT ?`,
+    [...params, Math.min(Number(limit) || 300, 1000)]
+  );
+};

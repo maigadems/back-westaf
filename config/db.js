@@ -1,7 +1,5 @@
 import mysql from 'mysql2/promise';
-import dotenv from 'dotenv';
-
-dotenv.config();
+import './env.js';
 
 const { DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME } = process.env;
 
@@ -17,11 +15,37 @@ export const pool = mysql.createPool({
   password: DB_PASSWORD,
   database: DB_NAME,
   waitForConnections: true,
-  connectionLimit: 5,
+  connectionLimit: Number(process.env.DB_POOL_SIZE) || 8,
   charset: 'utf8mb4',
-  // DATE / TIMESTAMP renvoyés en chaînes (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS)
+  // DATE / DATETIME renvoyés en chaînes (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS)
   dateStrings: true,
   timezone: 'Z'
 });
 
-console.log('✅ Pool MySQL initialisé');
+// Les sessions MySQL travaillent en UTC (= heure de Dakar)
+pool.on('connection', (conn) => {
+  conn.query("SET time_zone = '+00:00'");
+});
+
+export const q = async (sql, params = []) => {
+  const [rows] = await pool.query(sql, params);
+  return rows;
+};
+
+export const one = async (sql, params = []) => (await q(sql, params))[0] || null;
+
+// Exécute fn(conn) dans une transaction
+export const tx = async (fn) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const out = await fn(conn);
+    await conn.commit();
+    return out;
+  } catch (e) {
+    await conn.rollback().catch(() => {});
+    throw e;
+  } finally {
+    conn.release();
+  }
+};
