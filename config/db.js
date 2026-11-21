@@ -17,6 +17,11 @@ export const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_POOL_SIZE) || 8,
   charset: 'utf8mb4',
+  // Connexions gardées ouvertes et vérifiées : évite de rouvrir une connexion à chaque requête
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 10000,
+  maxIdle: Number(process.env.DB_POOL_SIZE) || 8,
+  idleTimeout: 300000,
   // DATE / DATETIME renvoyés en chaînes (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS)
   dateStrings: true,
   timezone: 'Z'

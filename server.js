@@ -16,6 +16,7 @@ import publicRoutes from './routes/public.js';
 import clientRoutes from './routes/client.js';
 import actionRoutes from './routes/actions.js';
 import adminRoutes from './routes/admin.js';
+import { clearPublicCache } from './routes/public.js';
 import engineerRoutes from './routes/engineer.js';
 import webhookRoutes from './routes/webhooks.js';
 import crypto from 'crypto';
@@ -48,6 +49,11 @@ app.use('/auth', authRoutes);
 app.use('/public', publicRoutes);
 app.use('/client', clientRoutes);
 app.use('/actions', actionRoutes);
+// Toute modification dans l'administration rafraîchit les données publiques en cache
+app.use('/admin', (req, res, next) => {
+  if (req.method !== 'GET') { clearPublicCache(); res.on('finish', clearPublicCache); }
+  next();
+});
 app.use('/admin', adminRoutes);
 app.use('/engineer', engineerRoutes);
 app.use('/', webhookRoutes);

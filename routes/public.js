@@ -9,6 +9,23 @@ import { vapidPublicKey } from '../services/pushService.js';
 
 const router = Router();
 
+// Cache mémoire des données publiques (services, paramètres, productions, équipements, galerie).
+// Les disponibilités ne sont jamais mises en cache. Vidé à chaque modification faite dans l'administration.
+const publicCache = new Map();
+const PUBLIC_TTL = 5 * 60 * 1000;
+export const clearPublicCache = () => publicCache.clear();
+router.use((req, res, next) => {
+  if (req.method !== 'GET' || req.path.startsWith('/availability')) return next();
+  const hit = publicCache.get(req.originalUrl);
+  if (hit && Date.now() - hit.at < PUBLIC_TTL) return res.json(hit.body);
+  const send = res.json.bind(res);
+  res.json = (body) => {
+    if (res.statusCode === 200) publicCache.set(req.originalUrl, { at: Date.now(), body });
+    return send(body);
+  };
+  next();
+});
+
 export const serializeService = (s) => {
   let features = [];
   try { features = JSON.parse(s.features || '[]'); } catch { features = []; }
