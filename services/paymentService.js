@@ -10,6 +10,7 @@ import { confirmBalancePayment, confirmInitialPayment, getReservation } from './
 import { logHistory } from './historyService.js';
 import * as notify from './notifier.js';
 import { issueAfterPayment } from './invoiceService.js';
+import { confirmMilestonePayment } from './orderService.js';
 
 const headers = () => ({
   Accept: 'application/json',
@@ -24,17 +25,17 @@ const ipnUrl = () => config.paytech.ipnUrl || (config.publicApiUrl ? `${config.p
  * Crée une demande de paiement PayTech pour une réservation.
  * kind : 'initial' (acompte / total) ou 'balance' (solde avant session).
  */
-export const startPaytechPayment = async (reservation, kind, amount) => {
+export const startPaytechPayment = async (reservation, kind, amount, milestone = null) => {
   if (!paytechConfigured()) throw new HttpError(503, 'Le paiement en ligne est momentanément indisponible. Contactez le studio.');
   if (!Number.isInteger(amount) || amount <= 0) throw badRequest('Montant invalide');
-  const ref = `${kind === 'initial' ? 'RES' : 'BAL'}_${reservation.id.slice(0, 8)}_${Date.now()}`;
-  await q("INSERT INTO payments (reservation_id, ref_command, kind, method, amount, status) VALUES (?, ?, ?, 'online', ?, 'pending')", [
-    reservation.id, ref, kind, amount
+  const ref = `${kind === 'initial' ? 'RES' : kind === 'milestone' ? 'ETP' : 'BAL'}_${reservation.id.slice(0, 8)}_${Date.now()}`;
+  await q("INSERT INTO payments (reservation_id, ref_command, kind, milestone_id, method, amount, status) VALUES (?, ?, ?, ?, 'online', ?, 'pending')", [
+    reservation.id, ref, kind, milestone?.id || null, amount
   ]);
   const ret = `${config.frontendUrl}/paiement/retour?ref=${encodeURIComponent(ref)}&r=${encodeURIComponent(reservation.id)}`;
   const label = `${reservation.service_name}${reservation.start_at ? ` — ${reservation.start_at.slice(0, 16)}` : ''}`;
   const payload = {
-    item_name: kind === 'initial' ? label : `Solde — ${label}`,
+    item_name: kind === 'initial' ? label : kind === 'milestone' ? `${milestone.label} — ${label}` : `Solde — ${label}`,
     item_price: amount,
     currency: config.paytech.currency,
     ref_command: ref,
@@ -103,6 +104,7 @@ export const handleIpn = async (b) => {
 
   const p = { ...payment, provider_method: b.payment_method };
   if (payment.kind === 'initial') await confirmInitialPayment(payment.reservation_id, p);
+  else if (payment.kind === 'milestone') await confirmMilestonePayment(p);
   else await confirmBalancePayment(payment.reservation_id, p);
   return { handled: payment.kind };
 };
@@ -149,9 +151,10 @@ const handleLegacyIpn = async (b) => {
   return { handled: 'legacy_created', id };
 };
 
-export const listPayments = async ({ status, method, limit = 300 } = {}) => {
+export const listPayments = async ({ status, method, month, limit = 300 } = {}) => {
   const where = [];
   const params = [];
+  if (/^\d{4}-\d{2}$/.test(String(month || ''))) { where.push('COALESCE(p.completed_at, p.created_at) >= ? AND COALESCE(p.completed_at, p.created_at) < (? + INTERVAL 1 MONTH)'); params.push(month + '-01', month + '-01'); }
   if (status) { where.push('p.status = ?'); params.push(status); }
   if (method) { where.push('p.method = ?'); params.push(method); }
   return q(
@@ -163,4 +166,50 @@ export const listPayments = async ({ status, method, limit = 300 } = {}) => {
      ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY p.created_at DESC LIMIT ?`,
     [...params, Math.min(Number(limit) || 300, 1000)]
   );
+};
+
+/**
+ * Totaux encaissés pour l'administration (paiements confirmés : en ligne et espèces validées).
+ * month : 'YYYY-MM' (mois courant par défaut).
+ */
+export const paymentSummary = async (month) => {
+  const m = /^\d{4}-\d{2}$/.test(String(month || '')) ? month : new Date().toISOString().slice(0, 7);
+  const start = m + '-01';
+  const sum = async (where, params = []) => {
+    const r = await one(
+      "SELECT COALESCE(SUM(amount), 0) AS amount, COUNT(*) AS n FROM payments WHERE status = 'completed' AND " + where, params
+    );
+    return { amount: Number(r.amount), count: Number(r.n) };
+  };
+  const inMonth = 'completed_at >= ? AND completed_at < (? + INTERVAL 1 MONTH)';
+  const [total, online, cash, prev, today, week, year, all] = await Promise.all([
+    sum(inMonth, [start, start]),
+    sum(inMonth + " AND method = 'online'", [start, start]),
+    sum(inMonth + " AND method = 'cash'", [start, start]),
+    sum('completed_at >= (? - INTERVAL 1 MONTH) AND completed_at < ?', [start, start]),
+    sum('DATE(completed_at) = UTC_DATE()'),
+    sum('completed_at >= UTC_DATE() - INTERVAL WEEKDAY(UTC_DATE()) DAY'),
+    sum("completed_at >= DATE_FORMAT(UTC_DATE(), '%Y-01-01')"),
+    sum('1 = 1')
+  ]);
+  const byKind = await q(
+    "SELECT kind, COALESCE(SUM(amount), 0) AS amount, COUNT(*) AS n FROM payments WHERE status = 'completed' AND " + inMonth + ' GROUP BY kind',
+    [start, start]
+  );
+  const daily = await q(
+    "SELECT DATE(completed_at) AS day, SUM(amount) AS amount, COUNT(*) AS n FROM payments WHERE status = 'completed' AND " + inMonth + ' GROUP BY DATE(completed_at) ORDER BY day',
+    [start, start]
+  );
+  const pendingCash = await one("SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS amount FROM payments WHERE method = 'cash' AND status = 'awaiting_validation'");
+  const outstanding = await one(
+    "SELECT COALESCE(SUM(montant_total - montant_paye), 0) AS due FROM reservations WHERE statut IN ('confirmee','a_traiter') AND montant_total > montant_paye"
+  );
+  return {
+    month: m,
+    total, online, cash, previousMonth: prev, today, week, year, allTime: all,
+    byKind: Object.fromEntries(byKind.map((k) => [k.kind, { amount: Number(k.amount), count: Number(k.n) }])),
+    daily: daily.map((d) => ({ day: d.day, amount: Number(d.amount), count: Number(d.n) })),
+    pendingCash: { count: Number(pendingCash.n), amount: Number(pendingCash.amount) },
+    outstanding: Number(outstanding.due)
+  };
 };

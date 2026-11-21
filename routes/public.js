@@ -5,6 +5,7 @@ import { ah, badRequest, notFound } from '../lib/http.js';
 import { isValidDate, todayStr } from '../lib/time.js';
 import { publicSettings, getInt } from '../services/settingsService.js';
 import { getDaySlots, getDaysSummary, getOpeningHours } from '../services/availabilityService.js';
+import { vapidPublicKey } from '../services/pushService.js';
 
 const router = Router();
 
@@ -19,7 +20,8 @@ router.get('/config', ah(async (_req, res) => {
   res.json({
     settings: await publicSettings(),
     openingHours: Object.values(hours),
-    googleClientId: config.google.clientId || null
+    googleClientId: config.google.clientId || null,
+    vapidPublicKey: vapidPublicKey()
   });
 }));
 
@@ -39,6 +41,13 @@ router.get('/equipment', ah(async (req, res) => {
   const items = await q(`SELECT id, name, category, description, is_featured, sort_order FROM equipment WHERE is_public = 1 ${featuredOnly ? 'AND is_featured = 1' : ''} ORDER BY sort_order, id`);
   const photos = items.length ? await q('SELECT id, equipment_id, url FROM equipment_photos WHERE equipment_id IN (?) ORDER BY sort_order, id', [items.map((i) => i.id)]) : [];
   res.json({ equipment: items.map((i) => ({ ...i, is_featured: !!i.is_featured, photos: photos.filter((p) => p.equipment_id === i.id) })) });
+}));
+
+router.get('/productions', ah(async (req, res) => {
+  const featuredOnly = req.query.featured === '1';
+  const rows = await q(`SELECT id, title, artist, description, cover_url, audio_url, link_url, platform, release_date, is_featured FROM productions
+    WHERE is_public = 1 ${featuredOnly ? 'AND is_featured = 1' : ''} ORDER BY sort_order, id`);
+  res.json({ productions: rows.map((p) => ({ ...p, is_featured: !!p.is_featured })) });
 }));
 
 router.get('/gallery', ah(async (req, res) => {

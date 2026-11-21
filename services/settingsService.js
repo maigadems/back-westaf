@@ -15,6 +15,7 @@ const SCHEMA = {
   instagram_url: { type: 'url', public: true },
   snapchat_url: { type: 'url', public: true },
   facebook_url: { type: 'url', public: true },
+  productions_playlist_url: { type: 'url', public: true },
   booking_window_days: { type: 'int', min: 1, max: 365, public: true },
   min_lead_minutes: { type: 'int', min: 0, max: 2880, public: true },
   hold_minutes: { type: 'int', min: 10, max: 180 },

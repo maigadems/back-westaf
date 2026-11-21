@@ -34,11 +34,13 @@
     "multer": "^2.5.0",
     "mysql2": "^3.24.5",
     "nodemailer": "^10.6.0",
-    "pdfkit": "^0.15.0"
+    "pdfkit": "^0.15.0",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "mysql-memory-server": "^1.18.0",
-    "nodemon": "^3.1.10"
+    "nodemon": "^3.1.10",
+    "selfsigned": "^2.4.1"
   },
   "engines": {
     "node": ">=18.0.0",

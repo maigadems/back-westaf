@@ -13,17 +13,19 @@ import {
 } from '../services/reservationService.js';
 import { getHistory } from '../services/historyService.js';
 import { dashboardStats } from '../services/statsService.js';
-import { listPayments } from '../services/paymentService.js';
+import { listPayments, paymentSummary } from '../services/paymentService.js';
 import { listNotifications, markRead } from '../services/notificationService.js';
 import { listMessages, sendTemplate } from '../services/whatsappService.js';
 import { getSettings, updateSettings } from '../services/settingsService.js';
 import { getDaySlots, getOpeningHours, saveOpeningHours } from '../services/availabilityService.js';
 import { canManageRole, createUser, deleteUserByAdmin, findUserById, listUsers, publicUser, setUserPassword, updateUserByAdmin } from '../services/userService.js';
 import { sendPasswordResetEmail } from '../services/emailService.js';
-import { imageUpload, publicPathFor, removeUpload } from '../services/mediaService.js';
+import { audioUpload, imageUpload, publicAudioPathFor, publicPathFor, removeUpload } from '../services/mediaService.js';
 import { serializeService } from './public.js';
-import { getInvoice, issueManually, listInvoices } from '../services/invoiceService.js';
+import { getInvoice, issueManually, listInvoices, sendInvoice } from '../services/invoiceService.js';
 import { invoiceFilename, renderInvoicePdf } from '../services/invoicePdf.js';
+import { pushConfigured } from '../services/pushService.js';
+import { getMilestones, listOrders, orderInfo, requestMilestone, updatePlan, validateMilestoneCash } from '../services/orderService.js';
 
 const router = Router();
 router.use(requireAdmin);
@@ -71,7 +73,7 @@ router.get('/reservations/:id', ah(async (req, res) => {
     listMessages({ reservationId: r.id, limit: 50 })
   ]);
   const invoice = await one('SELECT id, number FROM invoices WHERE reservation_id = ?', [r.id]);
-  res.json({ reservation: r, history, payments, messages, invoice });
+  res.json({ reservation: r, history, payments, messages, invoice, order: await orderInfo(r) });
 }));
 
 router.patch('/reservations/:id', ah(async (req, res) => res.json({ reservation: await adminUpdateReservation(await load(req.params.id), req.body || {}, req.user) })));
@@ -101,7 +103,39 @@ router.post('/reservations/:id/assign', ah(async (req, res) => {
   res.json({ reservation: await assignEngineer(await load(req.params.id), id, req.user) });
 }));
 
-router.post('/reservations/:id/validate-cash', ah(async (req, res) => res.json({ reservation: await validateCashPayment(await load(req.params.id), req.user) })));
+router.post('/reservations/:id/validate-cash', ah(async (req, res) => {
+  const r = await load(req.params.id);
+  // Commande par étapes : on encaisse l'étape demandée (ou la prochaine non réglée)
+  const ms = await getMilestones(r.id);
+  if (ms.length) {
+    const m = ms.find((x) => ['demande', 'en_attente_validation'].includes(x.status)) || ms.find((x) => x.status !== 'paye');
+    if (!m) throw badRequest('Cette commande est déjà entièrement réglée');
+    return res.json({ reservation: await validateMilestoneCash(r, m.id, req.user) });
+  }
+  res.json({ reservation: await validateCashPayment(r, req.user) });
+}));
+
+// ---------------------------------------------------------------- Commandes (mixage, mastering…) payées par étapes
+router.get('/orders', ah(async (req, res) => res.json({ orders: await listOrders({ status: req.query.status, search: req.query.search }) })));
+
+router.post('/reservations/:id/milestones/:mid/request', ah(async (req, res) => {
+  const r = await load(req.params.id);
+  res.json({ reservation: await requestMilestone(r, req.params.mid, { note: str(req.body?.note, { max: 2000 }) || '' }, req.user), order: await orderInfo(await load(req.params.id)) });
+}));
+
+router.post('/reservations/:id/milestones/:mid/validate-cash', ah(async (req, res) => {
+  const r = await load(req.params.id);
+  await validateMilestoneCash(r, req.params.mid, req.user);
+  const updated = await load(req.params.id);
+  res.json({ reservation: updated, order: await orderInfo(updated) });
+}));
+
+router.patch('/reservations/:id/plan', ah(async (req, res) => {
+  const r = await load(req.params.id);
+  await updatePlan(r, req.body?.percents || {}, req.user);
+  const updated = await load(req.params.id);
+  res.json({ reservation: updated, order: await orderInfo(updated) });
+}));
 
 router.post('/reservations/:id/session-status', ah(async (req, res) => {
   res.json({ reservation: await setSessionStatus(await load(req.params.id), req.body?.status, req.user) });
@@ -124,6 +158,13 @@ router.get('/invoices', ah(async (req, res) => {
   res.json({ invoices: await listInvoices({ search: f.search, status: f.status, from: isValidDate(f.from) ? f.from : undefined, to: isValidDate(f.to) ? f.to : undefined }) });
 }));
 router.get('/invoices/:id', ah(async (req, res) => res.json({ invoice: await getInvoice(req.params.id) })));
+// Envoi de la facture au client (e-mail avec PDF et/ou WhatsApp avec lien)
+router.post('/invoices/:id/send', ah(async (req, res) => {
+  const email = req.body?.email !== false;
+  const whatsapp = req.body?.whatsapp !== false;
+  if (!email && !whatsapp) throw badRequest('Choisissez au moins un canal d’envoi');
+  res.json({ result: await sendInvoice(Number(req.params.id), { email, whatsapp }) });
+}));
 router.get('/invoices/:id/pdf', ah(async (req, res) => {
   const inv = await getInvoice(req.params.id);
   res.setHeader('Content-Type', 'application/pdf');
@@ -137,7 +178,8 @@ router.post('/reservations/:id/invoice', ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------- Paiements
-router.get('/payments', ah(async (req, res) => res.json({ payments: await listPayments({ status: req.query.status, method: req.query.method }) })));
+router.get('/payments/summary', ah(async (req, res) => res.json(await paymentSummary(req.query.month))));
+router.get('/payments', ah(async (req, res) => res.json({ payments: await listPayments({ status: req.query.status, method: req.query.method, month: req.query.month }) })));
 
 // ---------------------------------------------------------------- Notifications
 router.get('/notifications', ah(async (req, res) => res.json(await listNotifications(req.user, { unreadOnly: req.query.unread === '1' }))));
@@ -282,6 +324,8 @@ const serviceInput = (b = {}) => {
   if (b.max_hours !== undefined) out.max_hours = int(b.max_hours, { min: 1, max: 16, field: 'durée maximale' });
   if (b.allow_deposit !== undefined) out.allow_deposit = bool(b.allow_deposit) ? 1 : 0;
   if (b.deposit_percent !== undefined) out.deposit_percent = int(b.deposit_percent, { min: 1, max: 100, field: 'acompte' });
+  if (b.milestone_percent !== undefined) out.milestone_percent = int(b.milestone_percent, { min: 0, max: 99, field: 'premiers livrables' }) ?? 0;
+  if ((out.deposit_percent ?? 0) + (out.milestone_percent ?? 0) > 100) throw badRequest('Acompte + premiers livrables ne peuvent pas dépasser 100 %');
   if (b.features !== undefined) {
     const list = Array.isArray(b.features) ? b.features : String(b.features || '').split('\n');
     out.features = JSON.stringify(list.map((f) => String(f).trim()).filter(Boolean).slice(0, 20));
@@ -501,6 +545,93 @@ router.delete('/gallery/:id', ah(async (req, res) => {
 
 router.put('/gallery-order', ah(async (req, res) => { await saveOrder('gallery_photos', req.body?.ids); res.json({ success: true }); }));
 
+// ---------------------------------------------------------------- Productions (derniers sons du studio)
+const PLATFORMS = ['apple_music', 'spotify', 'youtube', 'audiomack', 'boomplay', 'deezer', 'soundcloud', 'autre'];
+const productionInput = (b = {}) => {
+  const out = {};
+  if (b.title !== undefined) out.title = str(b.title, { field: 'titre', required: true, max: 150 });
+  if (b.artist !== undefined) out.artist = str(b.artist, { max: 150 });
+  if (b.description !== undefined) out.description = str(b.description, { max: 2000 });
+  if (b.link_url !== undefined) {
+    out.link_url = str(b.link_url, { max: 500 });
+    if (out.link_url && !/^https?:\/\/\S+$/i.test(out.link_url)) throw badRequest('Lien d’écoute invalide (doit commencer par https://)');
+  }
+  if (b.platform !== undefined) {
+    out.platform = b.platform ? String(b.platform) : null;
+    if (out.platform && !PLATFORMS.includes(out.platform)) throw badRequest('Plateforme invalide');
+  }
+  if (b.release_date !== undefined) {
+    out.release_date = b.release_date || null;
+    if (out.release_date && !isValidDate(out.release_date)) throw badRequest('Date de sortie invalide');
+  }
+  if (b.is_public !== undefined) out.is_public = bool(b.is_public) ? 1 : 0;
+  if (b.is_featured !== undefined) out.is_featured = bool(b.is_featured) ? 1 : 0;
+  return out;
+};
+const productionRow = (p) => p && { ...p, is_public: !!p.is_public, is_featured: !!p.is_featured };
+const loadProduction = async (id) => {
+  const p = await one('SELECT * FROM productions WHERE id = ?', [Number(id)]);
+  if (!p) throw notFound('Production introuvable');
+  return p;
+};
+
+router.get('/productions', ah(async (_req, res) => res.json({ productions: (await q('SELECT * FROM productions ORDER BY sort_order, id')).map(productionRow) })));
+
+router.post('/productions', ah(async (req, res) => {
+  const f = productionInput(req.body);
+  if (!f.title) throw badRequest('Titre requis');
+  // Les nouveautés s'affichent en premier
+  await q('UPDATE productions SET sort_order = sort_order + 1');
+  f.sort_order = 0;
+  const keys = Object.keys(f);
+  const cols = keys.map((k) => '`' + k + '`').join(', ');
+  const [r] = await pool.query('INSERT INTO productions (' + cols + ') VALUES (' + keys.map(() => '?').join(', ') + ')', keys.map((k) => f[k]));
+  res.status(201).json({ production: productionRow(await loadProduction(r.insertId)) });
+}));
+
+router.patch('/productions/:id', ah(async (req, res) => {
+  const p = await loadProduction(req.params.id);
+  await updateRow('productions', p.id, productionInput(req.body));
+  res.json({ production: productionRow(await loadProduction(p.id)) });
+}));
+
+router.delete('/productions/:id', ah(async (req, res) => {
+  const p = await loadProduction(req.params.id);
+  await q('DELETE FROM productions WHERE id = ?', [p.id]);
+  removeUpload(p.cover_url);
+  removeUpload(p.audio_url);
+  res.json({ success: true });
+}));
+
+router.post('/productions/:id/cover', imageUpload.single('image'), ah(async (req, res) => {
+  const p = await loadProduction(req.params.id);
+  if (!req.file) throw badRequest('Image manquante');
+  const url = publicPathFor(req.file);
+  await q('UPDATE productions SET cover_url = ? WHERE id = ?', [url, p.id]);
+  removeUpload(p.cover_url);
+  res.json({ production: productionRow(await loadProduction(p.id)) });
+}));
+
+router.post('/productions/:id/audio', audioUpload.single('audio'), ah(async (req, res) => {
+  const p = await loadProduction(req.params.id);
+  if (!req.file) throw badRequest('Fichier audio manquant');
+  const url = publicAudioPathFor(req.file);
+  await q('UPDATE productions SET audio_url = ? WHERE id = ?', [url, p.id]);
+  removeUpload(p.audio_url);
+  res.json({ production: productionRow(await loadProduction(p.id)) });
+}));
+
+router.delete('/productions/:id/media/:media', ah(async (req, res) => {
+  const p = await loadProduction(req.params.id);
+  const col = req.params.media === 'cover' ? 'cover_url' : req.params.media === 'audio' ? 'audio_url' : null;
+  if (!col) throw badRequest('Média invalide');
+  await q('UPDATE productions SET ' + col + ' = NULL WHERE id = ?', [p.id]);
+  removeUpload(p[col]);
+  res.json({ production: productionRow(await loadProduction(p.id)) });
+}));
+
+router.put('/productions-order', ah(async (req, res) => { await saveOrder('productions', req.body?.ids); res.json({ success: true }); }));
+
 // ---------------------------------------------------------------- Paramètres, horaires, fermetures
 router.get('/settings', ah(async (_req, res) => {
   res.json({
@@ -511,6 +642,7 @@ router.get('/settings', ah(async (_req, res) => {
       paytech: paytechConfigured(),
       smtp: smtpConfigured(),
       google: !!config.google.clientId,
+      push: pushConfigured(),
       templates: config.whatsapp.templates
     }
   });

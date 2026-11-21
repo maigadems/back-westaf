@@ -7,8 +7,12 @@ import m003 from './003_backfill_and_seed.js';
 import m004 from './004_invoices.js';
 import m005 from './005_long_sessions.js';
 import m006 from './006_remove_services.js';
+import m007 from './007_orders.js';
+import m008 from './008_order_addon.js';
+import m009 from './009_productions.js';
+import m010 from './010_push_subscriptions.js';
 
-const MIGRATIONS = [m001, m002, m003, m004, m005, m006];
+const MIGRATIONS = [m001, m002, m003, m004, m005, m006, m007, m008, m009, m010];
 
 export const helpers = (conn) => ({
   columnExists: async (table, column) => {

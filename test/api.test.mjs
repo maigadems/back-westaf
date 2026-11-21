@@ -6,9 +6,10 @@ import assert from 'node:assert/strict';
 import crypto from 'crypto';
 import express from 'express';
 import { execFileSync } from 'child_process';
+import https from 'https';
 
 // --- Faux fournisseurs externes ---
-const sent = { paytech: [], whatsapp: [] };
+const sent = { paytech: [], whatsapp: [], push: [] };
 const mock = express();
 mock.use(express.json());
 mock.post('/payment/request-payment', (req, res) => {
@@ -19,6 +20,20 @@ mock.post('/:version/:phoneId/messages', (req, res) => {
   sent.whatsapp.push(req.body);
   res.json({ messages: [{ id: `wamid.${sent.whatsapp.length}` }] });
 });
+// Faux service push en HTTPS (comme les vrais : Google, Apple, Mozilla), certificat auto-signé
+const cert = (await import('selfsigned')).default.generate([{ name: 'commonName', value: 'localhost' }], { days: 1, keySize: 2048 });
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // uniquement pour ce faux service local
+const pushMock = express();
+pushMock.post('/push/:device', (req, res) => {
+  let size = 0;
+  req.on('data', (c) => { size += c.length; });
+  req.on('end', () => {
+    sent.push.push({ device: req.params.device, encoding: req.headers['content-encoding'], size });
+    res.status(201).end();
+  });
+});
+const pushServer = await new Promise((r) => { const s = https.createServer({ key: cert.private, cert: cert.cert }, pushMock).listen(0, () => r(s)); });
+const pushUrl = `https://127.0.0.1:${pushServer.address().port}`;
 const mockServer = await new Promise((r) => { const s = mock.listen(0, () => r(s)); });
 const mockUrl = `http://127.0.0.1:${mockServer.address().port}`;
 
@@ -26,6 +41,10 @@ process.env.PAYTECH_BASE_URL = mockUrl;
 process.env.WHATSAPP_API_BASE = mockUrl;
 process.env.WHATSAPP_TOKEN = 'wa-token';
 process.env.WHATSAPP_PHONE_NUMBER_ID = '123456';
+// Clés VAPID générées pour les tests de notifications push
+const vapid = (await import('web-push')).default.generateVAPIDKeys();
+process.env.VAPID_PUBLIC_KEY = vapid.publicKey;
+process.env.VAPID_PRIVATE_KEY = vapid.privateKey;
 process.env.PORT = '0';
 await import('./env.js');
 execFileSync(process.execPath, ['test/seed-legacy.mjs'], { stdio: 'ignore' });
@@ -43,6 +62,7 @@ before(async () => {
 after(async () => {
   server?.close();
   mockServer.close();
+  pushServer.close();
   await pool.end();
 });
 
@@ -539,4 +559,183 @@ test('session de plusieurs heures : créneaux, blocage complet, facture', async 
   const detail = await api('GET', `/client/invoices/${inv.id}`, { token: state.client });
   assert.equal(detail.data.invoice.lines[0].quantity, 6);
   assert.equal(detail.data.invoice.total, 180000);
+});
+
+test('commande de mixage payée par étapes : acompte, premiers livrables, livraison finale', async () => {
+  const svc = (await api('GET', '/public/services')).data.services.find((s) => s.slug === 'mixage');
+  assert.equal(svc.deposit_percent, 30);
+  assert.equal(svc.milestone_percent, 40);
+  const total = svc.price * 2;
+
+  // 1. Commande + acompte en ligne
+  const c = await api('POST', '/client/reservations', { token: state.client, body: { service_id: svc.id, tracks: 2 } });
+  assert.equal(c.status, 201, JSON.stringify(c.data));
+  assert.equal(c.data.amountNow, Math.round(total * 0.3));
+  const id = c.data.reservation.id;
+  await ipn(sent.paytech.at(-1));
+  let r = (await api('GET', `/client/reservations/${id}`, { token: state.client })).data.reservation;
+  assert.equal(r.statut, 'confirmee');
+  assert.deepEqual(r.order.milestones.map((m) => [m.kind, m.status]), [['acompte', 'paye'], ['premiers_livrables', 'a_venir'], ['livraison_finale', 'a_venir']]);
+  assert.equal(r.order.milestones.reduce((s, m) => s + m.amount, 0), total, 'somme des étapes = total');
+  assert.equal(r.can_pay_balance, false, 'rien à payer tant que Jeuss n’a rien demandé');
+  assert.equal((await api('POST', `/client/reservations/${id}/pay-balance`, { token: state.client })).status, 400);
+
+  // Jeuss ajuste l'échéancier de cette commande : 50 % aux premiers livrables, 20 % à la fin
+  const ms = r.order.milestones;
+  const plan = await api('PATCH', `/admin/reservations/${id}/plan`, { token: state.admin, body: { percents: { [ms[1].id]: 50 } } });
+  assert.equal(plan.status, 200, JSON.stringify(plan.data));
+  assert.deepEqual(plan.data.order.milestones.map((m) => m.percent), [30, 50, 20]);
+
+  // 2. Premiers livrables : demande de paiement → client paie en ligne
+  const before = sent.whatsapp.length;
+  const req1 = await api('POST', `/admin/reservations/${id}/milestones/${ms[1].id}/request`, { token: state.admin, body: { note: 'Écoute : https://drive.example/mix-v1' } });
+  assert.equal(req1.status, 200, JSON.stringify(req1.data));
+  const wa = sent.whatsapp.slice(before).find((m) => m.to === '221772223344');
+  assert.ok(wa && /paiement\//.test(JSON.stringify(wa)) && /mix-v1/.test(JSON.stringify(wa)), 'client prévenu avec le lien des livrables et de paiement');
+  // Impossible de demander la livraison finale avant le règlement des premiers livrables
+  assert.equal((await api('POST', `/admin/reservations/${id}/milestones/${ms[2].id}/request`, { token: state.admin, body: {} })).status, 400);
+  const pay = await api('POST', `/client/reservations/${id}/pay-balance`, { token: state.client });
+  assert.equal(pay.status, 200, JSON.stringify(pay.data));
+  assert.equal(sent.paytech.at(-1).item_price, Math.round(total * 0.5));
+  await ipn(sent.paytech.at(-1));
+
+  // 3. Livraison finale : le client choisit les espèces, Jeuss valide
+  await api('POST', `/admin/reservations/${id}/milestones/${ms[2].id}/request`, { token: state.admin, body: { note: 'Fichiers finaux envoyés' } });
+  const [[{ action_token }]] = await pool.query('SELECT action_token FROM reservations WHERE id = ?', [id]);
+  const page = await api('GET', `/actions/${action_token}`);
+  assert.equal(page.data.reservation.milestone.label, 'Livraison finale');
+  assert.equal(page.data.reservation.amount_due, total - Math.round(total * 0.3) - Math.round(total * 0.5));
+  assert.equal((await api('POST', `/actions/${action_token}/pay-cash`)).status, 200);
+  const val = await api('POST', `/admin/reservations/${id}/milestones/${ms[2].id}/validate-cash`, { token: state.admin });
+  assert.equal(val.status, 200, JSON.stringify(val.data));
+  assert.equal(val.data.reservation.statut, 'terminee');
+  assert.equal(val.data.reservation.payment_status, 'paye');
+  assert.equal(val.data.reservation.montant_paye, total);
+
+  // Liste admin des commandes et facture avec les 3 étapes
+  const orders = await api('GET', '/admin/orders', { token: state.admin });
+  assert.ok(orders.data.orders.some((o) => o.id === id && o.order.milestones.every((m) => m.status === 'paye')));
+  const inv = (await api('GET', '/client/invoices', { token: state.client })).data.invoices.find((i) => i.reservation_id === id);
+  const detail = await api('GET', `/client/invoices/${inv.id}`, { token: state.client });
+  assert.deepEqual(detail.data.invoice.payments.map((p) => p.label.split(' · ')[0]), ['Acompte à la commande', 'Premiers livrables', 'Livraison finale']);
+  assert.equal(detail.data.invoice.due, 0);
+});
+
+test('mixage d’un titre avec le mastering en option : une seule commande, deux lignes de facture', async () => {
+  const services = (await api('GET', '/public/services')).data.services;
+  const mix = services.find((s) => s.slug === 'mixage');
+  const master = services.find((s) => s.slug === 'mastering');
+  const total = mix.price + master.price;
+  const c = await api('POST', '/client/reservations', { token: state.client, body: { service_id: mix.id, tracks: 1, with_mastering: true } });
+  assert.equal(c.status, 201, JSON.stringify(c.data));
+  assert.equal(c.data.reservation.montant_total, total);
+  assert.equal(c.data.reservation.service_name, `${mix.name} + ${master.name}`);
+  assert.equal(c.data.amountNow, Math.round(total * 0.3), 'acompte sur le total mixage + mastering');
+  // Option refusée sur un autre service
+  assert.equal((await api('POST', '/client/reservations', { token: state.client, body: { service_id: master.id, tracks: 1, with_mastering: true } })).status, 400);
+  await ipn(sent.paytech.at(-1));
+  const inv = (await api('GET', '/client/invoices', { token: state.client })).data.invoices.find((i) => i.reservation_id === c.data.reservation.id);
+  const lines = (await api('GET', `/client/invoices/${inv.id}`, { token: state.client })).data.invoice.lines;
+  assert.deepEqual(lines.map((l) => [l.label, l.quantity, l.unit_price]), [[mix.name, 1, mix.price], [master.name, 1, master.price]]);
+});
+
+test('facture envoyée après chaque paiement, renvoi à la demande et lien public', async () => {
+  const svc = (await api('GET', '/public/services')).data.services.find((s) => s.slug === 'mastering');
+  const before = sent.whatsapp.length;
+  const c = await api('POST', '/client/reservations', { token: state.client, body: { service_id: svc.id, tracks: 1 } });
+  assert.equal(c.status, 201, JSON.stringify(c.data));
+  await ipn(sent.paytech.at(-1));
+  // WhatsApp automatique avec le lien de la facture
+  const msg = sent.whatsapp.slice(before).find((m) => m.to === '221772223344' && /facture N° WR-/.test(JSON.stringify(m)));
+  assert.ok(msg, 'facture envoyée au client après le paiement');
+  const link = JSON.stringify(msg).match(/\/facture\/([a-f0-9]{48})/);
+  assert.ok(link, 'lien de téléchargement présent');
+
+  // Lien public : facture + PDF, sans connexion
+  const pub = await api('GET', `/actions/${link[1]}/invoice`);
+  assert.equal(pub.status, 200);
+  assert.ok(!('user_id' in pub.data.invoice));
+  const pdf = await fetch(`${base}/actions/${link[1]}/invoice/pdf`);
+  assert.equal(pdf.status, 200);
+  assert.equal(pdf.headers.get('content-type'), 'application/pdf');
+
+  // La réservation du client indique sa facture
+  const r = await api('GET', `/client/reservations/${c.data.reservation.id}`, { token: state.client });
+  assert.equal(r.data.reservation.invoice_id, pub.data.invoice.id);
+
+  // Renvoi : par Jeuss (e-mail + WhatsApp) et par le client (e-mail) — SMTP non configuré dans les tests
+  const b2 = sent.whatsapp.length;
+  const adminSend = await api('POST', `/admin/invoices/${pub.data.invoice.id}/send`, { token: state.admin, body: { email: true, whatsapp: true } });
+  assert.deepEqual(adminSend.data.result, { email: 'not_configured', whatsapp: 'sent' });
+  assert.equal(sent.whatsapp.length, b2 + 1, 'renvoi manuel effectué');
+  const clientSend = await api('POST', `/client/invoices/${pub.data.invoice.id}/send`, { token: state.client });
+  assert.deepEqual(clientSend.data.result, { email: 'not_configured' });
+  assert.equal((await api('POST', `/client/invoices/${pub.data.invoice.id}/send`, { token: state.legacyToken })).status, 404);
+  assert.equal((await api('POST', `/admin/invoices/${pub.data.invoice.id}/send`, { token: state.client })).status, 403);
+});
+
+test('productions : sons du studio gérés par l’admin et affichés publiquement', async () => {
+  // Les 3 titres de l'ancien site sont repris
+  const initial = (await api('GET', '/public/productions')).data.productions;
+  assert.ok(initial.some((p) => p.title === 'Fatou Sangaré' && /music\.apple\.com/.test(p.link_url)));
+
+  // Nouvelle production avec pochette et extrait audio
+  const c = await api('POST', '/admin/productions', { token: state.admin, body: { title: 'Nouveau single', artist: 'Artiste test', link_url: 'https://open.spotify.com/track/xyz', platform: 'spotify', release_date: '2026-11-01', is_featured: true } });
+  assert.equal(c.status, 201, JSON.stringify(c.data));
+  const id = c.data.production.id;
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da6364f8cf000000040001021e0b8b0000000049454e44ae426082', 'hex');
+  const fdc = new FormData();
+  fdc.append('image', new Blob([png], { type: 'image/png' }), 'cover.png');
+  assert.equal((await fetch(`${base}/admin/productions/${id}/cover`, { method: 'POST', headers: { Authorization: `Bearer ${state.admin}` }, body: fdc })).status, 200);
+  const mp3 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(200)]);
+  const fda = new FormData();
+  fda.append('audio', new Blob([mp3], { type: 'audio/mpeg' }), 'extrait.mp3');
+  const up = await fetch(`${base}/admin/productions/${id}/audio`, { method: 'POST', headers: { Authorization: `Bearer ${state.admin}` }, body: fda });
+  assert.equal(up.status, 200);
+  const fake = new FormData();
+  fake.append('audio', new Blob([Buffer.from('pas un son')], { type: 'audio/mpeg' }), 'x.mp3');
+  assert.equal((await fetch(`${base}/admin/productions/${id}/audio`, { method: 'POST', headers: { Authorization: `Bearer ${state.admin}` }, body: fake })).status, 400);
+
+  const pub = (await api('GET', '/public/productions')).data.productions;
+  assert.equal(pub[0].title, 'Nouveau single', 'la nouveauté apparaît en premier');
+  assert.ok(pub[0].cover_url && pub[0].audio_url);
+  assert.equal((await fetch(base + pub[0].audio_url)).status, 200);
+
+  // Masquage, contrôle d'accès, lien invalide
+  await api('PATCH', `/admin/productions/${id}`, { token: state.admin, body: { is_public: false } });
+  assert.ok(!(await api('GET', '/public/productions')).data.productions.some((p) => p.id === id));
+  assert.equal((await api('POST', '/admin/productions', { token: state.admin, body: { title: 'X', link_url: 'javascript:alert(1)' } })).status, 400);
+  assert.equal((await api('GET', '/admin/productions', { token: state.client })).status, 403);
+  assert.equal((await api('DELETE', `/admin/productions/${id}`, { token: state.admin })).status, 200);
+});
+
+test('notifications push : le téléphone de Jeuss reçoit chaque notification', async () => {
+  const cfg = await api('GET', '/public/config');
+  assert.ok(cfg.data.vapidPublicKey, 'clé publique fournie au site');
+  // Abonnement d'un appareil (clés de chiffrement d'un vrai navigateur simulées)
+  const ecdh = crypto.createECDH('prime256v1');
+  ecdh.generateKeys();
+  const subscription = (device) => ({ endpoint: pushUrl + '/push/' + device, keys: { p256dh: ecdh.getPublicKey().toString('base64url'), auth: crypto.randomBytes(16).toString('base64url') } });
+  assert.equal((await api('POST', '/auth/push/subscribe', { token: state.admin, body: { subscription: subscription('jeuss'), app: 'admin' } })).status, 201);
+  assert.equal((await api('POST', '/auth/push/subscribe', { body: { subscription: subscription('anonyme') } })).status, 401);
+  assert.equal((await api('POST', '/auth/push/subscribe', { token: state.admin, body: { subscription: { endpoint: 'pas-une-url' } } })).status, 400);
+
+  // Nouvelle réservation payée → notification push sur le téléphone de Jeuss
+  const before = sent.push.length;
+  const day = futureDay(12);
+  const svc = (await api('GET', '/public/services')).data.services.find((x) => x.slug === 'enregistrement-studio');
+  const r = await api('POST', '/client/reservations', { token: state.client, body: { service_id: svc.id, start: day + ' 09:00', hours: 1, payment_option: 'full' } });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  await ipn(sent.paytech.at(-1));
+  await new Promise((ok) => setTimeout(ok, 500));
+  const pushes = sent.push.slice(before).filter((x) => x.device === 'jeuss');
+  assert.ok(pushes.length >= 1, 'notification push envoyée');
+  assert.equal(pushes[0].encoding, 'aes128gcm', 'contenu chiffré de bout en bout');
+
+  // Désabonnement : plus d'envoi
+  await api('POST', '/auth/push/unsubscribe', { token: state.admin, body: { endpoint: pushUrl + '/push/jeuss' } });
+  const b2 = sent.push.length;
+  await api('POST', '/admin/reservations/' + r.data.reservation.id + '/cancel', { token: state.admin, body: { reason: 'test push' } });
+  await new Promise((ok) => setTimeout(ok, 300));
+  assert.equal(sent.push.slice(b2).filter((x) => x.device === 'jeuss').length, 0);
 });

@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import PDFDocument from 'pdfkit';
+import { Writable } from 'stream';
 
 const LOGO = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'assets', 'invoice-logo.jpg');
 const INK = '#18181b';
@@ -124,3 +125,12 @@ export const renderInvoicePdf = (inv, out) => {
 
   doc.end();
 };
+
+/** Génère le PDF en mémoire (Buffer), pour l'envoyer par e-mail. */
+export const renderInvoicePdfBuffer = (inv) => new Promise((resolve, reject) => {
+  const chunks = [];
+  const sink = new Writable({ write(chunk, _enc, cb) { chunks.push(chunk); cb(); } });
+  sink.on('finish', () => resolve(Buffer.concat(chunks)));
+  sink.on('error', reject);
+  renderInvoicePdf(inv, sink);
+});

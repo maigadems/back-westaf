@@ -178,6 +178,20 @@ par Meta sont ignorés (déduplication par identifiant de message).
   ⚠️ L'ancien `.env.example` contenait de vraies clés PayTech dans l'historique Git : régénérez-les depuis
   votre espace PayTech.
 
+## Notifications push (téléphones)
+
+Chaque notification de l'équipe (nouvelle réservation, paiement, demande d'espèces, report…) et du client
+est aussi envoyée en notification push sur les appareils où la personne l'a autorisée.
+
+1. Générer une paire de clés **une seule fois** : `npx web-push generate-vapid-keys`.
+2. Renseigner `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` et `VAPID_SUBJECT=mailto:contact@westafrecords.com`
+   dans le `.env` du serveur, puis redémarrer. Ne changez plus ces clés : tous les abonnements seraient perdus.
+3. Paramètres → Intégrations affiche « Notifications push » en vert.
+
+Les abonnements sont stockés dans `push_subscriptions` (migration 010) et supprimés automatiquement quand
+le navigateur les invalide. Le site doit être servi en **HTTPS**. Sur iPhone (iOS 16.4+), l'application doit
+d'abord être ajoutée à l'écran d'accueil.
+
 ## Tâches planifiées
 
 Le planificateur interne tourne toutes les minutes (rappels, liens de paiement, libération des créneaux non

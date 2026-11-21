@@ -31,6 +31,7 @@ app.use(helmet());
 app.use(cors({
   origin: config.corsOrigins,
   allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Disposition'],
   methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS']
 }));
 // rawBody conservé pour vérifier la signature des webhooks WhatsApp

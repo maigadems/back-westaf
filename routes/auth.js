@@ -11,6 +11,7 @@ import {
   createUser, findUserByEmail, findUserByLegacyPhone, findUserById, publicUser, setUserPassword, signToken, touchLogin
 } from '../services/userService.js';
 import { sendPasswordResetEmail } from '../services/emailService.js';
+import { pushConfigured, removeSubscription, saveSubscription } from '../services/pushService.js';
 
 const router = Router();
 const googleClient = new OAuth2Client();
@@ -189,6 +190,21 @@ router.post('/change-password', requireAuth(), ah(async (req, res) => {
 // Déconnexion de tous les appareils
 router.post('/logout-all', requireAuth(), ah(async (req, res) => {
   await q('UPDATE users SET token_version = token_version + 1 WHERE id = ?', [req.user.id]);
+  res.json({ success: true });
+}));
+
+// Notifications push : abonnement de l'appareil de l'utilisateur connecté
+router.post('/push/subscribe', requireAuth(), ah(async (req, res) => {
+  if (!pushConfigured()) throw new HttpError(503, 'Les notifications push ne sont pas encore configurées sur le serveur');
+  try {
+    await saveSubscription(req.user.id, req.body?.subscription, { app: req.body?.app === 'admin' ? 'admin' : 'client', userAgent: req.headers['user-agent'] });
+  } catch (e) {
+    throw badRequest(e.message);
+  }
+  res.status(201).json({ success: true });
+}));
+router.post('/push/unsubscribe', requireAuth(), ah(async (req, res) => {
+  await removeSubscription(req.user.id, req.body?.endpoint);
   res.json({ success: true });
 }));
 

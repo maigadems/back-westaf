@@ -8,6 +8,7 @@ import { getInt } from './settingsService.js';
 import { logHistory } from './historyService.js';
 import * as notify from './notifier.js';
 import { issueAfterPayment } from './invoiceService.js';
+import { insertMilestones, markDepositPaid, planFromService, rescaleUnpaid } from './orderService.js';
 
 // Statuts
 export const STATUTS = ['en_attente', 'confirmee', 'annulee', 'terminee', 'expiree', 'a_traiter'];
@@ -21,11 +22,12 @@ export const COMPLETED_SQL = "(r.statut = 'terminee' OR (r.statut = 'confirmee' 
 // Réservations « réelles » : hors paniers non payés / expirés
 export const REAL_SQL = "r.statut NOT IN ('en_attente','expiree')";
 
-const BASE_SELECT = `SELECT r.*, s.name AS service_name, s.slug AS service_slug, s.booking_mode,
+const BASE_SELECT = `SELECT r.*, s.name AS service_name, s.slug AS service_slug, s.booking_mode, a.name AS addon_name, s.price AS service_unit_price,
     TRIM(CONCAT(COALESCE(e.first_name,''), ' ', COALESCE(e.last_name,''))) AS engineer_name, e.phone AS engineer_phone,
     u.first_name AS client_first_name, u.last_name AS client_last_name, u.email AS client_email, u.phone AS client_phone
   FROM reservations r
   LEFT JOIN services s ON s.id = r.service_id
+  LEFT JOIN services a ON a.id = r.addon_service_id
   LEFT JOIN users e ON e.id = r.engineer_id
   LEFT JOIN users u ON u.id = r.user_id`;
 
@@ -37,7 +39,8 @@ const parse = (r) => {
   return {
     ...r,
     creneaux,
-    service_name: r.service_name || LEGACY_NAMES[r.type_service] || r.type_service,
+    service_name: `${r.service_name || LEGACY_NAMES[r.type_service] || r.type_service}${r.addon_name ? ` + ${r.addon_name}` : ''}`,
+    base_service_name: r.service_name || LEGACY_NAMES[r.type_service] || r.type_service,
     booking_mode: r.booking_mode || (r.type_service === 'horaire' ? 'slot' : 'per_track'),
     duree_heures: hours ?? null,
     montant_total: Number(r.montant_total),
@@ -137,8 +140,13 @@ export const createBooking = async (user, input) => {
     if (!Number.isInteger(tracks) || tracks < 1 || tracks > 50) throw badRequest('Nombre de titres invalide (1 à 50)');
     total = service.price * tracks;
   }
-  const deposit = service.allow_deposit && input.payment_option === 'deposit';
-  const amountNow = deposit ? Math.ceil((total * service.deposit_percent) / 100) : total;
+  const addon = input.with_mastering ? await masteringAddonFor(service) : null;
+  if (input.with_mastering && !addon) throw badRequest('Le mastering n’est pas disponible en option pour ce service');
+  if (addon) total += addon.price * tracks;
+  // Commande au titre (mixage, mastering) : paiement par étapes fixées par le studio
+  const plan = service.booking_mode === 'per_track' ? planFromService(service) : null;
+  const deposit = plan ? plan.length > 1 : service.allow_deposit && input.payment_option === 'deposit';
+  let amountNow = plan ? Math.round((total * plan[0].percent) / 100) : deposit ? Math.ceil((total * service.deposit_percent) / 100) : total;
 
   await tx(async (conn) => {
     await conn.query(
@@ -151,6 +159,8 @@ export const createBooking = async (user, input) => {
         LEGACY_TYPES[service.slug] || service.slug, tracks, token, addMinutes(new Date(), holdMinutes)]
     );
     if (start) await lockSlots(conn, id, start, end);
+    if (addon) await conn.query('UPDATE reservations SET addon_service_id = ?, addon_unit_price = ? WHERE id = ?', [addon.id, addon.price, id]);
+    if (plan) amountNow = await insertMilestones(conn, id, total, plan);
     await logHistory(id, user, 'created', { to: start, service: service.name, amountNow }, conn);
   });
 
@@ -183,6 +193,8 @@ export const adminCreateBooking = async (actor, input) => {
     tracks = Number(input.tracks) || 1;
     total = (service.price || 0) * tracks;
   }
+  const addon = input.with_mastering ? await masteringAddonFor(service) : null;
+  if (addon) total += addon.price * tracks;
   if (input.montant_total !== undefined && input.montant_total !== '') total = Number(input.montant_total);
   if (!Number.isInteger(total) || total < 0) throw badRequest('Montant invalide');
 
@@ -197,11 +209,23 @@ export const adminCreateBooking = async (actor, input) => {
         total === 0 && start ? 'autorisee' : 'planifiee', LEGACY_TYPES[service.slug] || service.slug, tracks, crypto.randomBytes(24).toString('hex')]
     );
     if (start) await lockSlots(conn, id, start, end);
+    if (addon) await conn.query('UPDATE reservations SET addon_service_id = ?, addon_unit_price = ? WHERE id = ?', [addon.id, addon.price, id]);
+    if (service.booking_mode === 'per_track' && total > 0) {
+      await insertMilestones(conn, id, total, planFromService(service), { firstStatus: 'demande' });
+      await conn.query("UPDATE reservations SET type_paiement = 'partiel', production_status = 'en_attente' WHERE id = ?", [id]);
+    }
     await logHistory(id, actor, 'created', { to: start, service: service.name, by: 'admin' }, conn);
   });
   let r = await getReservation(id);
   if (input.engineer_id) r = await assignEngineer(r, Number(input.engineer_id), actor);
   return r;
+};
+
+// Mastering proposé en option lors d'une commande de mixage (service actif avec un tarif)
+export const masteringAddonFor = async (service) => {
+  if (service.slug !== 'mixage') return null;
+  const m = await one("SELECT id, name, price FROM services WHERE slug = 'mastering' AND is_active = 1 AND booking_mode = 'per_track' AND price > 0");
+  return m || null;
 };
 
 const lockSlots = async (conn, reservationId, start, end) => {
@@ -270,6 +294,7 @@ export const confirmInitialPayment = async (reservationId, payment) => {
          session_status = IF(? = 'paye' AND start_at IS NOT NULL, 'autorisee', session_status) WHERE id = ?`,
       [paid, ps, ps, r.id]
     );
+    await markDepositPaid(conn, r.id);
     await logHistory(r.id, null, 'payment_initial', { amount: payment.amount, method: payment.provider_method || 'online', status: ps }, conn);
     return { status: 'confirmed' };
   });
@@ -460,6 +485,7 @@ export const adminUpdateReservation = async (res, input, actor) => {
     const logged = { ...changes };
     delete logged.internal_notes;
     await logHistory(res.id, actor, 'updated', { fields: keys, ...logged });
+    if (changes.montant_total !== undefined) await rescaleUnpaid(res.id, changes.montant_total);
   }
   let current = await getReservation(res.id);
 

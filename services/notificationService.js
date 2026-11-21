@@ -1,10 +1,15 @@
-import { q } from '../config/db.js';
+import { q, one } from '../config/db.js';
+import { pushToStaff, pushToUser } from './pushService.js';
+
+// Envoi push en arrière-plan : n'interrompt jamais l'opération en cours
+const background = (promise) => { promise.catch((e) => console.error('❌ Push :', e.message)); };
 
 // Notification pour l'équipe d'administration (Jeuss + super admin) : user_id NULL
 export const notifyStaff = async ({ type, title, body = '', reservationId = null, financial = false }) => {
   await q('INSERT INTO notifications (user_id, type, title, body, reservation_id, is_financial) VALUES (NULL, ?, ?, ?, ?, ?)', [
     type, title, body, reservationId, financial ? 1 : 0
   ]);
+  background(pushToStaff({ title, body: String(body).slice(0, 240), tag: type, url: reservationId ? '/admin/reservations?id=' + reservationId : '/admin/dashboard' }));
 };
 
 export const notifyUser = async (userId, { type, title, body = '', reservationId = null }) => {
@@ -12,6 +17,11 @@ export const notifyUser = async (userId, { type, title, body = '', reservationId
   await q('INSERT INTO notifications (user_id, type, title, body, reservation_id) VALUES (?, ?, ?, ?, ?)', [
     userId, type, title, body, reservationId
   ]);
+  const u = await one('SELECT role FROM users WHERE id = ?', [userId]);
+  const url = u?.role === 'engineer' ? (reservationId ? '/ingenieur?session=' + reservationId : '/ingenieur')
+    : u?.role === 'client' ? (reservationId ? '/mon-espace/reservations?voir=' + reservationId : '/mon-espace')
+      : (reservationId ? '/admin/reservations?id=' + reservationId : '/admin/dashboard');
+  background(pushToUser(userId, { title, body: String(body).slice(0, 240), tag: type, url }));
 };
 
 const scope = (user) =>

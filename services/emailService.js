@@ -32,14 +32,14 @@ const button = (href, label) =>
  * Envoi réel via SMTP. Si le SMTP n'est pas configuré, rien n'est envoyé
  * et l'appelant reçoit { sent: false, reason }.
  */
-export const sendMail = async ({ to, subject, html, text }) => {
+export const sendMail = async ({ to, subject, html, text, attachments }) => {
   if (!smtpConfigured()) {
     console.warn(`✉️  SMTP non configuré : e-mail « ${subject} » non envoyé à ${to}`);
     return { sent: false, reason: 'smtp_not_configured' };
   }
   try {
     const studio = await getSetting('studio_name', 'Studio');
-    await getTransporter().sendMail({ from: `"${studio}" <${config.smtp.from}>`, to, subject, html, text });
+    await getTransporter().sendMail({ from: `"${studio}" <${config.smtp.from}>`, to, subject, html, text, attachments });
     return { sent: true };
   } catch (e) {
     console.error('❌ Envoi e-mail:', e.message);
@@ -66,5 +66,23 @@ export const sendBookingEmail = async (to, { title, lines, link, linkLabel }) =>
     subject: `${studio} — ${title}`,
     text: `${lines.join('\n')}${link ? `\n\n${link}` : ''}`,
     html: layout(studio, title, `${lines.map((l) => `<p style="margin:6px 0">${esc(l)}</p>`).join('')}${link ? button(link, linkLabel || 'Voir mon espace') : ''}`)
+  });
+};
+
+// Envoi d'une facture avec le PDF en pièce jointe
+export const sendInvoiceEmail = async (to, inv, pdf, link) => {
+  const studio = await getSetting('studio_name', 'Studio');
+  const money = (n) => `${Number(n || 0).toLocaleString('fr-FR')} FCFA`;
+  const lines = [
+    `Bonjour ${inv.client.name || ''},`,
+    `Veuillez trouver ci-joint votre facture N° ${inv.number} (${inv.reservation.service_name}).`,
+    `Total : ${money(inv.total)} · Déjà réglé : ${money(inv.paid)} · Reste à payer : ${money(inv.due)}`
+  ];
+  return sendMail({
+    to,
+    subject: `${studio} — Facture ${inv.number}`,
+    text: `${lines.join('\n')}\n\n${link}`,
+    html: layout(studio, `Facture ${inv.number}`, `${lines.map((l) => `<p style="margin:6px 0">${esc(l)}</p>`).join('')}${button(link, 'Voir la facture en ligne')}`),
+    attachments: [{ filename: `facture-${inv.number}.pdf`, content: pdf, contentType: 'application/pdf' }]
   });
 };

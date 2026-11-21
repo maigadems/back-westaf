@@ -5,12 +5,13 @@ import { isValidDate, minutesUntil } from '../lib/time.js';
 import { requireClient } from '../middleware/auth.js';
 import { getDaySlots, getDaysSummary } from '../services/availabilityService.js';
 import { getInt } from '../services/settingsService.js';
-import { getInvoice, listInvoices } from '../services/invoiceService.js';
+import { getInvoice, listInvoices, sendInvoice } from '../services/invoiceService.js';
 import { invoiceFilename, renderInvoicePdf } from '../services/invoicePdf.js';
 import { startPaytechPayment } from '../services/paymentService.js';
 import {
   abandonHold, assertOwner, createBooking, forClient, getReservation, listReservations, requestCashPayment, rescheduleReservation
 } from '../services/reservationService.js';
+import { currentDueMilestone, orderInfo, requestMilestoneCash } from '../services/orderService.js';
 
 const router = Router();
 router.use(requireClient);
@@ -23,6 +24,14 @@ const withRules = async (r) => {
   out.reschedule_limit_minutes = limit;
   out.can_pay_balance = r.statut === 'confirmee' && r.solde > 0 && r.payment_status !== 'en_attente_validation';
   out.can_resume_payment = r.statut === 'en_attente';
+  out.invoice_id = (await one('SELECT id FROM invoices WHERE reservation_id = ?', [r.id]))?.id ?? null;
+  // Commande (mixage, mastering) : on ne règle que l'étape demandée par le studio
+  const order = await orderInfo(r);
+  if (order && order.milestones.length) {
+    out.order = order;
+    const due = order.milestones.find((m) => m.id === order.current_id);
+    out.can_pay_balance = ['confirmee', 'terminee'].includes(r.statut) && due?.status === 'demande';
+  }
   return out;
 };
 
@@ -61,6 +70,12 @@ router.post('/reservations/:id/resume-payment', ah(async (req, res) => {
 
 router.post('/reservations/:id/pay-balance', ah(async (req, res) => {
   const r = assertOwner(await getReservation(req.params.id), req.user);
+  const m = await currentDueMilestone(r);
+  if (m) {
+    if (m.status !== 'demande') throw badRequest('Paiement en espèces déjà annoncé pour cette étape');
+    return res.json({ redirectUrl: (await startPaytechPayment(r, 'milestone', m.amount, m)).redirectUrl });
+  }
+  if ((await orderInfo(r))?.milestones.length) throw badRequest('Aucun paiement n’est demandé pour le moment');
   if (r.statut !== 'confirmee' || r.solde <= 0) throw badRequest('Aucun solde à régler');
   const pay = await startPaytechPayment(r, 'balance', r.solde);
   res.json({ redirectUrl: pay.redirectUrl });
@@ -68,7 +83,8 @@ router.post('/reservations/:id/pay-balance', ah(async (req, res) => {
 
 router.post('/reservations/:id/pay-cash', ah(async (req, res) => {
   const r = assertOwner(await getReservation(req.params.id), req.user);
-  res.json({ reservation: await withRules(await requestCashPayment(r, 'espace_client')) });
+  const isOrder = (await orderInfo(r))?.milestones.length;
+  res.json({ reservation: await withRules(isOrder ? await requestMilestoneCash(r, 'espace_client') : await requestCashPayment(r, 'espace_client')) });
 }));
 
 // Disponibilités pour un report (le créneau actuel du client est considéré comme libre)
@@ -95,6 +111,12 @@ router.get('/invoices/:id/pdf', ah(async (req, res) => {
   const inv = await getInvoice(req.params.id);
   if (inv.user_id !== req.user.id) throw notFound('Facture introuvable');
   sendPdf(res, inv);
+}));
+// Le client reçoit sa facture par e-mail (à l'adresse de son compte uniquement)
+router.post('/invoices/:id/send', ah(async (req, res) => {
+  const inv = await getInvoice(req.params.id);
+  if (inv.user_id !== req.user.id) throw notFound('Facture introuvable');
+  res.json({ result: await sendInvoice(inv.id, { email: true, whatsapp: false }) });
 }));
 router.get('/invoices/:id', ah(async (req, res) => {
   const inv = await getInvoice(req.params.id);

@@ -3,6 +3,10 @@ import { q, one, tx } from '../config/db.js';
 import { notFound, badRequest } from '../lib/http.js';
 import { getSettings } from './settingsService.js';
 import { getReservation } from './reservationService.js';
+import { config } from '../config/env.js';
+import { sendInvoiceEmail } from './emailService.js';
+import { renderInvoicePdfBuffer } from './invoicePdf.js';
+import { sendTemplate } from './whatsappService.js';
 
 /**
  * Émet la facture d'une réservation si elle n'existe pas encore (idempotent).
@@ -36,15 +40,73 @@ export const ensureInvoice = async (reservationId) => {
 // Émission « silencieuse » après un paiement : ne bloque jamais l'encaissement
 export const issueAfterPayment = async (reservationId) => {
   try {
-    await ensureInvoice(reservationId);
+    const id = await ensureInvoice(reservationId);
+    // Après chaque paiement réussi, la facture à jour est envoyée au client (e-mail + WhatsApp)
+    if (id) await sendInvoice(id, { email: true, whatsapp: true, reason: 'payment' });
   } catch (e) {
-    console.error('❌ Facture non émise pour', reservationId, e.message);
+    console.error('❌ Facture non émise ou non envoyée pour', reservationId, e.message);
   }
+};
+
+export const invoiceShareUrl = (token) => `${config.frontendUrl}/facture/${token}`;
+
+/**
+ * Envoie la facture au client : e-mail (PDF joint) et/ou WhatsApp (lien de téléchargement).
+ * Retourne le résultat par canal : 'sent' | 'not_configured' | 'no_contact' | 'failed'.
+ */
+export const sendInvoice = async (invoiceId, { email = true, whatsapp = true, reason = 'manual' } = {}) => {
+  const inv = await getInvoice(invoiceId);
+  const r = await one('SELECT action_token, telephone, email FROM reservations WHERE id = ?', [inv.reservation.id]);
+  const link = invoiceShareUrl(r.action_token);
+  const result = {};
+  if (email) {
+    const to = inv.client.email || r.email;
+    if (!to) result.email = 'no_contact';
+    else {
+      const sent = await sendInvoiceEmail(to, inv, await renderInvoicePdfBuffer(inv), link);
+      result.email = sent.sent ? 'sent' : sent.reason === 'smtp_not_configured' ? 'not_configured' : 'failed';
+    }
+  }
+  if (whatsapp) {
+    const phone = inv.client.phone || r.telephone;
+    if (!phone) result.whatsapp = 'no_contact';
+    else {
+      const money = (n) => `${Number(n || 0).toLocaleString('fr-FR')} FCFA`;
+      const text = `votre facture N° ${inv.number} (${inv.reservation.service_name}) est disponible. Réglé : ${money(inv.paid)}${inv.due > 0 ? `, reste à payer : ${money(inv.due)}` : ' (soldée)'}. Téléchargez-la ici : ${link}`;
+      const wa = await sendTemplate({
+        to: phone, template: config.whatsapp.templates.clientUpdate, params: [inv.client.name.split(' ')[0] || inv.client.name, text],
+        kind: 'client_invoice', reservationId: inv.reservation.id,
+        // Un seul envoi automatique par état de paiement de la facture ; les envois manuels ne sont pas dédoublonnés
+        dedupeKey: reason === 'payment' ? `invoice:${inv.id}:${inv.paid}` : null
+      });
+      result.whatsapp = wa.skipped ? 'sent' : wa.ok ? 'sent' : wa.status === 'not_configured' ? 'not_configured' : 'failed';
+    }
+  }
+  return result;
+};
+
+export const getInvoiceByToken = async (token) => {
+  if (!/^[a-f0-9]{48}$/.test(String(token || ''))) throw notFound('Lien invalide');
+  const row = await one('SELECT i.id FROM invoices i JOIN reservations r ON r.id = i.reservation_id WHERE r.action_token = ?', [token]);
+  if (!row) throw notFound('Aucune facture pour le moment');
+  return getInvoice(row.id);
 };
 
 const METHOD = { cash: 'Espèces', online: 'Paiement en ligne' };
 
 const buildLines = (r, service) => {
+  if (r.addon_service_id && r.addon_unit_price) {
+    const qty = Number(r.nombre_titres || 1);
+    const addonTotal = Number(r.addon_unit_price) * qty;
+    const mainTotal = Number(r.montant_total) - addonTotal;
+    const mainUnit = qty > 0 && mainTotal % qty === 0 ? mainTotal / qty : null;
+    return [
+      mainUnit !== null
+        ? { label: r.base_service_name, detail: null, quantity: qty, unit: 'titre', unit_price: mainUnit, total: mainTotal }
+        : { label: r.base_service_name, detail: `${qty} titre(s)`, quantity: 1, unit: 'forfait', unit_price: mainTotal, total: mainTotal },
+      { label: r.addon_name || 'Mastering', detail: 'En option avec le mixage', quantity: qty, unit: 'titre', unit_price: Number(r.addon_unit_price), total: addonTotal }
+    ];
+  }
   const total = Number(r.montant_total);
   const qty = r.booking_mode === 'slot' ? Number(r.duree_heures || 1) : Number(r.nombre_titres || 1);
   const unit = r.booking_mode === 'slot' ? 'heure' : 'titre';
@@ -52,9 +114,9 @@ const buildLines = (r, service) => {
   // Tarif unitaire affiché seulement s'il correspond exactement au total
   const unitPrice = qty > 0 && total % qty === 0 ? total / qty : null;
   if (unitPrice !== null && (!service?.price || service.price === unitPrice)) {
-    return [{ label: r.service_name, detail, quantity: qty, unit, unit_price: unitPrice, total }];
+    return [{ label: r.base_service_name || r.service_name, detail, quantity: qty, unit, unit_price: unitPrice, total }];
   }
-  return [{ label: r.service_name, detail: detail ? `${detail} · ${qty} ${unit}(s)` : `${qty} ${unit}(s)`, quantity: 1, unit: 'forfait', unit_price: total, total }];
+  return [{ label: r.base_service_name || r.service_name, detail: detail ? `${detail} · ${qty} ${unit}(s)` : `${qty} ${unit}(s)`, quantity: 1, unit: 'forfait', unit_price: total, total }];
 };
 
 const statusOf = (r, paid) => (['annulee'].includes(r.statut) ? 'annulee' : paid >= Number(r.montant_total) ? 'payee' : 'partielle');
@@ -65,7 +127,9 @@ export const getInvoice = async (id) => {
   const r = await getReservation(inv.reservation_id);
   const service = r?.service_id ? await one('SELECT price FROM services WHERE id = ?', [r.service_id]) : null;
   const payments = await q(
-    "SELECT id, amount, method, provider_method, kind, ref_command, completed_at FROM payments WHERE reservation_id = ? AND status = 'completed' ORDER BY completed_at, id",
+    `SELECT p.id, p.amount, p.method, p.provider_method, p.kind, p.ref_command, p.completed_at, m.label AS milestone_label
+     FROM payments p LEFT JOIN order_milestones m ON m.id = p.milestone_id
+     WHERE p.reservation_id = ? AND p.status = 'completed' ORDER BY p.completed_at, p.id`,
     [inv.reservation_id]
   );
   const paid = payments.reduce((s, p) => s + Number(p.amount), 0);
@@ -75,6 +139,7 @@ export const getInvoice = async (id) => {
     number: inv.number,
     issued_at: inv.issued_at,
     user_id: inv.user_id,
+    share_url: invoiceShareUrl((await one('SELECT action_token FROM reservations WHERE id = ?', [inv.reservation_id]))?.action_token),
     status: statusOf(r, paid),
     currency: 'FCFA',
     issuer: {
@@ -94,7 +159,7 @@ export const getInvoice = async (id) => {
     due: Math.max(0, Number(r.montant_total) - paid),
     payments: payments.map((p) => ({
       id: p.id, date: p.completed_at, amount: Number(p.amount), reference: p.ref_command,
-      label: `${p.kind === 'initial' ? 'Paiement à la réservation' : 'Solde'} · ${p.method === 'online' && p.provider_method ? p.provider_method : METHOD[p.method]}`
+      label: `${p.milestone_label || (p.kind === 'initial' ? 'Paiement à la réservation' : 'Solde')} · ${p.method === 'online' && p.provider_method ? p.provider_method : METHOD[p.method]}`
     }))
   };
 };

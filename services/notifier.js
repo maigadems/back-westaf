@@ -208,3 +208,36 @@ export const scheduledFailure = safe(async (r, what, result) => {
     reservationId: r.id
   });
 });
+
+// --- Commandes payées par étapes (mixage, mastering…) ---
+
+const payLink = (r) => `${config.frontendUrl}/paiement/${r.action_token}`;
+
+export const milestoneRequested = safe(async (r, m, resend) => {
+  const note = m.deliverable_note ? ` ${m.deliverable_note}` : '';
+  const what = m.kind === 'livraison_finale' ? 'votre commande est livrée' : m.kind === 'premiers_livrables' ? 'vos premiers livrables sont prêts' : 'votre commande est enregistrée';
+  const text = `${what} (« ${r.service_name} », ${r.nombre_titres || 1} titre(s)).${note} Merci de régler l’étape « ${m.label} » : ${fcfa(m.amount)}. Paiement en ligne ou en espèces : ${payLink(r)}`;
+  if (r.user_id) await notifyUser(r.user_id, { type: 'milestone_requested', title: `${m.label} — paiement de ${fcfa(m.amount)} demandé`, body: text, reservationId: r.id });
+  await waClient(r, 'client_milestone_request', text, resend ? null : `milestone_req:${m.id}`);
+  await sendBookingEmail(r.client_email || r.email, {
+    title: `${m.label} — ${r.service_name}`,
+    lines: [`Bonjour ${r.first_name || ''},`, `${what.charAt(0).toUpperCase()}${what.slice(1)}.`, ...(m.deliverable_note ? [`Livrables : ${m.deliverable_note}`] : []), `Montant à régler : ${fcfa(m.amount)} (${m.percent} %)`],
+    link: payLink(r),
+    linkLabel: 'Régler maintenant'
+  });
+});
+
+export const milestonePaid = safe(async (r, m, amount, method, finished) => {
+  const title = `${m.label} réglée${method === 'cash' ? ' (espèces)' : ''}`;
+  const body = adminDetails(r, [`Étape : ${m.label}`, `Montant : ${fcfa(amount)}`, finished ? 'Commande entièrement réglée' : `Reste : ${fcfa(r.solde)}`]);
+  await notifyStaff({ type: 'milestone_paid', title: `${title} — ${r.nom}`, body, reservationId: r.id, financial: true });
+  if (method === 'online') await waAdmin(r, 'admin_milestone_paid', title, body, `admin_milestone:${m.id}`);
+  await waClient(r, 'client_milestone_paid', `nous avons bien reçu votre paiement de ${fcfa(amount)} (« ${m.label} »).${finished ? ' Votre commande est entièrement réglée, merci !' : ''}`, `client_milestone_paid:${m.id}`);
+});
+
+export const milestoneCashRequested = safe(async (r, m) => {
+  const title = 'Paiement en espèces (commande)';
+  const body = adminDetails(r, [`Étape : ${m.label}`, `Montant à encaisser : ${fcfa(m.amount)}`, 'Validez la réception depuis Admin → Commandes']);
+  await notifyStaff({ type: 'cash_request', title: `${title} — ${r.nom}`, body, reservationId: r.id, financial: true });
+  await waAdmin(r, 'admin_cash_request', title, body, `admin_cash_milestone:${m.id}`);
+});

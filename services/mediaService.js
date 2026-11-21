@@ -50,3 +50,39 @@ export const removeUpload = (url) => {
   const name = path.basename(String(url));
   fs.rm(path.join(uploadRoot, name), { force: true }, () => {});
 };
+
+const AUDIO = { 'audio/mpeg': '.mp3', 'audio/mp3': '.mp3', 'audio/mp4': '.m4a', 'audio/x-m4a': '.m4a', 'audio/aac': '.m4a', 'audio/wav': '.wav', 'audio/x-wav': '.wav', 'audio/wave': '.wav' };
+
+// Extrait audio d’une production : MP3, M4A ou WAV (20 Mo max), signature binaire vérifiée
+export const audioUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadRoot),
+    filename: (_req, file, cb) => cb(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${AUDIO[file.mimetype]}`)
+  }),
+  limits: { fileSize: 20 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    if (!AUDIO[file.mimetype]) return cb(badRequest('Format audio non accepté (MP3, M4A ou WAV)'));
+    cb(null, true);
+  }
+});
+
+const looksLikeAudio = (file) => {
+  try {
+    const fd = fs.openSync(file, 'r');
+    const b = Buffer.alloc(12);
+    fs.readSync(fd, b, 0, 12, 0);
+    fs.closeSync(fd);
+    return b.toString('ascii', 0, 3) === 'ID3' || (b[0] === 0xff && (b[1] & 0xe0) === 0xe0) ||
+      b.toString('ascii', 4, 8) === 'ftyp' || (b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WAVE');
+  } catch {
+    return false;
+  }
+};
+
+export const publicAudioPathFor = (file) => {
+  if (!looksLikeAudio(file.path)) {
+    fs.rmSync(file.path, { force: true });
+    throw badRequest('Le fichier n’est pas un fichier audio valide');
+  }
+  return `/uploads/${file.filename}`;
+};
