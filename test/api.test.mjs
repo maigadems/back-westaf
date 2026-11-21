@@ -153,12 +153,12 @@ test('Google : refus propre tant que GOOGLE_CLIENT_ID n’est pas configuré', a
 
 test('comptes initiaux et rôles', async () => {
   // Comptes fixés par la migration 012 : présents, actifs, mot de passe à changer à la première connexion
-  const [staff] = await pool.query("SELECT role, email, must_change_password, is_active FROM users WHERE email IN ('paapamatarndiaye@esp.sn', 'jeuss.beat@westafrecords.com') ORDER BY email DESC");
+  const [staff] = await pool.query("SELECT role, email, must_change_password, is_active FROM users WHERE email IN ('papamatarndiaye@esp.sn', 'jeuss.beat@westafrecords.com') ORDER BY email DESC");
   assert.deepEqual(staff.map((u) => [u.role, u.must_change_password, u.is_active]), [['super_admin', 1, 1], ['admin', 1, 1]]);
   // Mot de passe de test pour le super admin (les vrais mots de passe ne figurent jamais dans les tests)
   const { hashPassword } = await import('../lib/password.js');
-  await pool.query("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE email = 'paapamatarndiaye@esp.sn'", [hashPassword('SuperPass123')]);
-  state.super = await login('paapamatarndiaye@esp.sn', 'SuperPass123');
+  await pool.query("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE email = 'papamatarndiaye@esp.sn'", [hashPassword('SuperPass123')]);
+  state.super = await login('papamatarndiaye@esp.sn', 'SuperPass123');
   const jeuss = await api('POST', '/admin/users', { token: state.super, body: { role: 'admin', first_name: 'Jeuss', email: 'jeuss@studio.test', password: 'JeussPass123' } });
   assert.equal(jeuss.status, 201);
   state.admin = await login('jeuss@studio.test', 'JeussPass123');

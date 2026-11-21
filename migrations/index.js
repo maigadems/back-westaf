@@ -13,8 +13,9 @@ import m009 from './009_productions.js';
 import m010 from './010_push_subscriptions.js';
 import m011 from './011_app_secrets.js';
 import m012 from './012_staff_accounts.js';
+import m013 from './013_fix_super_admin_email.js';
 
-const MIGRATIONS = [m001, m002, m003, m004, m005, m006, m007, m008, m009, m010, m011, m012];
+const MIGRATIONS = [m001, m002, m003, m004, m005, m006, m007, m008, m009, m010, m011, m012, m013];
 
 export const helpers = (conn) => ({
   columnExists: async (table, column) => {
