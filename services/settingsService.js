@@ -12,6 +12,7 @@ const SCHEMA = {
   contact_email_2: { type: 'string', max: 190, public: true },
   address: { type: 'string', max: 255, public: true },
   maps_url: { type: 'url', public: true },
+  yango_url: { type: 'url', public: true },
   instagram_url: { type: 'url', public: true },
   snapchat_url: { type: 'url', public: true },
   facebook_url: { type: 'url', public: true },
