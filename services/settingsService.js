@@ -25,6 +25,8 @@ const SCHEMA = {
   reschedule_limit_minutes: { type: 'int', min: 0, max: 10080, public: true },
   respect_engineer_unavailability: { type: 'bool' },
   notify_engineer_whatsapp: { type: 'bool' },
+  // Envoi WhatsApp automatique (API Meta) : désactivé, les messages sont envoyés à la main depuis l'admin
+  whatsapp_auto: { type: 'bool' },
   invoice_prefix: { type: 'string', max: 8 },
   invoice_company_name: { type: 'string', max: 150 },
   invoice_address: { type: 'string', max: 255 },

@@ -6,6 +6,10 @@ import crypto from 'crypto';
 import { q, pool } from '../config/db.js';
 import { config, whatsappConfigured } from '../config/env.js';
 import { intlPhone } from '../lib/phone.js';
+import { getSetting } from './settingsService.js';
+
+// Mode manuel (par défaut) : aucun message automatique n'est envoyé ni journalisé
+export const whatsappAutoEnabled = async () => (await getSetting('whatsapp_auto', '0')) === '1';
 
 const apiBase = () => (process.env.WHATSAPP_API_BASE || 'https://graph.facebook.com').replace(/\/$/, '');
 
@@ -32,6 +36,7 @@ const postToApi = async (body) => {
  * dedupeKey : un même message ne part jamais deux fois (contrainte UNIQUE).
  */
 const send = async ({ to, kind, reservationId = null, dedupeKey = null, template = null, body }) => {
+  if (!(await whatsappAutoEnabled())) return { ok: false, status: 'manual', skipped: true };
   const phone = intlPhone(to);
   if (!phone) {
     await q('INSERT INTO whatsapp_messages (direction, kind, reservation_id, to_phone, template, status, error) VALUES (?,?,?,?,?,?,?)', [

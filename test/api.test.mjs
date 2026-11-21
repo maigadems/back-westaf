@@ -54,6 +54,9 @@ let server, base;
 before(async () => {
   server = await start();
   base = `http://127.0.0.1:${server.address().port}`;
+  // Mode manuel par défaut en production ; les tests vérifient aussi l'envoi automatique, réactivable
+  const { updateSettings } = await import('../services/settingsService.js');
+  await updateSettings({ whatsapp_auto: '1' });
 });
 after(async () => {
   server?.close();
