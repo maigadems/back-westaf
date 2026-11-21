@@ -58,13 +58,15 @@ router.post('/login', ah(async (req, res) => {
   const password = String(req.body?.password || '');
   if (!identifier || !password) throw badRequest('Adresse e-mail et mot de passe requis');
   const rl = `login:${req.ip}:${identifier.toLowerCase()}`;
-  if (isBlocked(rl)) throw new HttpError(429, 'Trop de tentatives. Réessayez dans 15 minutes.');
 
   // E-mail, ou numéro de téléphone pour les comptes créés par l'ancien système
   // (ou identifiant de l'ancien compte administrateur, ADMIN_LOGIN)
   const user = (await findUserByEmail(identifier)) || (identifier.includes('@') ? null : await findUserByLegacyPhone(localPhone(identifier)));
+  // Demande du studio : pas de blocage après plusieurs essais pour les comptes admin / super admin
+  const unlimited = user && ['admin', 'super_admin'].includes(user.role);
+  if (!unlimited && isBlocked(rl)) throw new HttpError(429, 'Trop de tentatives. Réessayez dans 15 minutes.');
   if (!user || !user.password_hash || !verifyPassword(password, user.password_hash)) {
-    recordFailure(rl);
+    if (!unlimited) recordFailure(rl);
     if (user && !user.password_hash) {
       throw unauthorized(user.google_id
         ? 'Ce compte utilise la connexion Google.'
@@ -175,9 +177,10 @@ router.patch('/me', requireAuth(), ah(async (req, res) => {
 router.post('/change-password', requireAuth(), ah(async (req, res) => {
   const { current_password, new_password } = req.body || {};
   const rl = `pwd:${req.user.id}`;
-  if (isBlocked(rl)) throw new HttpError(429, 'Trop de tentatives. Réessayez plus tard.');
+  const unlimited = ['admin', 'super_admin'].includes(req.user.role);
+  if (!unlimited && isBlocked(rl)) throw new HttpError(429, 'Trop de tentatives. Réessayez plus tard.');
   if (req.user.password_hash && !verifyPassword(String(current_password || ''), req.user.password_hash)) {
-    recordFailure(rl);
+    if (!unlimited) recordFailure(rl);
     throw badRequest('Mot de passe actuel incorrect');
   }
   if (current_password && current_password === new_password) throw badRequest('Le nouveau mot de passe doit être différent de l’actuel');
