@@ -7,13 +7,21 @@ process.env.TZ = process.env.TZ || 'Africa/Dakar';
 
 const list = (v, def = '') => String(v ?? def).split(',').map((s) => s.trim()).filter(Boolean);
 const trimSlash = (u) => String(u || '').replace(/\/+$/, '');
+// Première URL valide (tolère une valeur mal saisie du type « https://a.comhttps://a.com/ »)
+const firstUrl = (v) => { const m = String(v || '').match(/https?:\/\/.*?(?=https?:\/\/|$)/); return m ? m[0].trim() : ''; };
+const PROD_SITE = 'https://westafrecords.com';
+const PROD_API = 'https://forestgreen-mole-128636.hostingersite.com';
+// Valeur d'exemple jamais remplacée dans un ancien .env
+const real = (v) => (v && !/votre-domaine|exemple\.com/.test(v) ? v : '');
 
 export const config = {
   port: Number(process.env.PORT) || 5000,
   nodeEnv: process.env.NODE_ENV || 'production',
-  frontendUrl: trimSlash(process.env.FRONTEND_URL || 'https://westafrecords.com'),
-  publicApiUrl: trimSlash(process.env.PUBLIC_API_URL || ''),
-  corsOrigins: list(process.env.CORS_ORIGINS, 'https://westafrecords.com'),
+  frontendUrl: trimSlash(firstUrl(process.env.FRONTEND_URL) || PROD_SITE),
+  publicApiUrl: trimSlash(real(process.env.PUBLIC_API_URL) || (process.env.NODE_ENV === 'test' ? '' : PROD_API)),
+  // Origines de l'ancien .env + adresses du site toujours autorisées
+  corsOrigins: [...new Set([...list(process.env.CORS_ORIGINS), PROD_SITE, 'https://www.westafrecords.com', 'https://harmonious-florentine-0eff6a.netlify.app'])],
+  // Clé des sessions : JWT_SECRET ou ancienne ADMIN_TOKEN_SECRET si assez longue ; sinon générée au démarrage (app_secrets)
   jwtSecret: process.env.JWT_SECRET || process.env.ADMIN_TOKEN_SECRET || '',
   jwtTtl: process.env.JWT_TTL || '7d',
   staffJwtTtl: process.env.STAFF_JWT_TTL || '12h',
@@ -38,7 +46,7 @@ export const config = {
     apiKey: process.env.PAYTECH_API_KEY || '',
     apiSecret: process.env.PAYTECH_API_SECRET || '',
     env: process.env.PAYTECH_ENV || 'prod',
-    ipnUrl: process.env.PAYTECH_IPN_URL || '',
+    ipnUrl: real(process.env.PAYTECH_IPN_URL),
     refundNotifUrl: process.env.PAYTECH_REFUND_NOTIF_URL || '',
     currency: process.env.CURRENCY || 'XOF'
   },
@@ -63,6 +71,8 @@ export const config = {
     superAdminPassword: process.env.SUPER_ADMIN_PASSWORD || '',
     adminEmail: process.env.ADMIN_EMAIL || '',
     adminPassword: process.env.ADMIN_PASSWORD || '',
+    // Identifiants admin de l'ancien serveur (déjà présents sur Hostinger)
+    legacyLogin: process.env.ADMIN_LOGIN || '',
     adminFirstName: process.env.ADMIN_FIRST_NAME || 'Jeuss'
   }
 };

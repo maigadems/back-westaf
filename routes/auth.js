@@ -61,7 +61,8 @@ router.post('/login', ah(async (req, res) => {
   if (isBlocked(rl)) throw new HttpError(429, 'Trop de tentatives. Réessayez dans 15 minutes.');
 
   // E-mail, ou numéro de téléphone pour les comptes créés par l'ancien système
-  const user = identifier.includes('@') ? await findUserByEmail(identifier) : await findUserByLegacyPhone(localPhone(identifier));
+  // (ou identifiant de l'ancien compte administrateur, ADMIN_LOGIN)
+  const user = (await findUserByEmail(identifier)) || (identifier.includes('@') ? null : await findUserByLegacyPhone(localPhone(identifier)));
   if (!user || !user.password_hash || !verifyPassword(password, user.password_hash)) {
     recordFailure(rl);
     if (user && !user.password_hash) {

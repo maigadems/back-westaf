@@ -41,10 +41,6 @@ process.env.PAYTECH_BASE_URL = mockUrl;
 process.env.WHATSAPP_API_BASE = mockUrl;
 process.env.WHATSAPP_TOKEN = 'wa-token';
 process.env.WHATSAPP_PHONE_NUMBER_ID = '123456';
-// Clés VAPID générées pour les tests de notifications push
-const vapid = (await import('web-push')).default.generateVAPIDKeys();
-process.env.VAPID_PUBLIC_KEY = vapid.publicKey;
-process.env.VAPID_PRIVATE_KEY = vapid.privateKey;
 process.env.PORT = '0';
 await import('./env.js');
 execFileSync(process.execPath, ['test/seed-legacy.mjs'], { stdio: 'ignore' });
@@ -156,7 +152,15 @@ test('Google : refus propre tant que GOOGLE_CLIENT_ID n’est pas configuré', a
 });
 
 test('comptes initiaux et rôles', async () => {
-  state.super = await login('super@studio.test', 'SuperPass123');
+  // Comptes fixés par la migration 012 : présents, actifs, mot de passe à changer à la première connexion
+  const [staff] = await pool.query("SELECT role, email, must_change_password, is_active FROM users WHERE email IN ('paapamatarndiaye@esp.sn', 'jeuss.beat@westafrecords.com') ORDER BY email DESC");
+  assert.deepEqual(staff.map((u) => [u.role, u.must_change_password, u.is_active]), [['super_admin', 1, 1], ['admin', 1, 1]]);
+  // Mot de passe de test pour le super admin (les vrais mots de passe ne figurent jamais dans les tests)
+  const { hashPassword } = await import('../lib/password.js');
+  await pool.query("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE email = 'paapamatarndiaye@esp.sn'", [hashPassword('SuperPass123')]);
+  state.super = await login('paapamatarndiaye@esp.sn', 'SuperPass123');
+  const jeuss = await api('POST', '/admin/users', { token: state.super, body: { role: 'admin', first_name: 'Jeuss', email: 'jeuss@studio.test', password: 'JeussPass123' } });
+  assert.equal(jeuss.status, 201);
   state.admin = await login('jeuss@studio.test', 'JeussPass123');
   // Jeuss ne peut pas créer d'administrateur ; le super admin oui
   const no = await api('POST', '/admin/users', { token: state.admin, body: { role: 'admin', first_name: 'A', email: 'a@studio.test' } });

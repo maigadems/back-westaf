@@ -1,16 +1,28 @@
 // Notifications push (Web Push / VAPID) : affichées sur l'écran du téléphone même application fermée.
-// Clés VAPID : VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY (générer avec `npx web-push generate-vapid-keys`).
+// Clés VAPID : VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY si elles existent dans l'environnement (facultatif),
+// sinon générées automatiquement au premier démarrage et conservées en base (table app_secrets).
 import webpush from 'web-push';
 import { q } from '../config/db.js';
 import { sha256 } from '../lib/password.js';
+import { getOrCreateSecret } from './secretService.js';
 
-const PUBLIC = process.env.VAPID_PUBLIC_KEY || '';
-const PRIVATE = process.env.VAPID_PRIVATE_KEY || '';
+let PUBLIC = '';
+let PRIVATE = '';
 const SUBJECT = process.env.VAPID_SUBJECT || 'mailto:contact@westafrecords.com';
 
 export const pushConfigured = () => !!(PUBLIC && PRIVATE);
 export const vapidPublicKey = () => (pushConfigured() ? PUBLIC : null);
-if (pushConfigured()) webpush.setVapidDetails(SUBJECT, PUBLIC, PRIVATE);
+
+/** Appelé au démarrage, après les migrations. */
+export const initPush = async () => {
+  let keys = { publicKey: process.env.VAPID_PUBLIC_KEY || '', privateKey: process.env.VAPID_PRIVATE_KEY || '' };
+  if (!keys.publicKey || !keys.privateKey) {
+    keys = JSON.parse(await getOrCreateSecret('vapid_keys', () => JSON.stringify(webpush.generateVAPIDKeys())));
+  }
+  webpush.setVapidDetails(SUBJECT, keys.publicKey, keys.privateKey);
+  PUBLIC = keys.publicKey;
+  PRIVATE = keys.privateKey;
+};
 
 export const saveSubscription = async (userId, sub, { app = null, userAgent = null } = {}) => {
   const endpoint = String(sub?.endpoint || '');

@@ -18,11 +18,10 @@ import actionRoutes from './routes/actions.js';
 import adminRoutes from './routes/admin.js';
 import engineerRoutes from './routes/engineer.js';
 import webhookRoutes from './routes/webhooks.js';
+import crypto from 'crypto';
+import { getOrCreateSecret } from './services/secretService.js';
+import { initPush } from './services/pushService.js';
 
-if (!config.jwtSecret || config.jwtSecret.length < 32) {
-  console.error('❌ JWT_SECRET manquant ou trop court (32 caractères minimum). Voir .env.example');
-  process.exit(1);
-}
 
 export const app = express();
 app.set('trust proxy', 1);
@@ -77,6 +76,11 @@ app.use(errorHandler);
 
 export const start = async () => {
   if (config.autoMigrate) await runMigrations();
+  // Secrets absents ou trop courts dans l'environnement : générés une fois et conservés en base
+  if (!config.jwtSecret || config.jwtSecret.length < 32) {
+    config.jwtSecret = await getOrCreateSecret('jwt_secret', () => crypto.randomBytes(48).toString('hex'));
+  }
+  await initPush();
   await bootstrapAccounts();
   startScheduler();
   return new Promise((resolve) => {

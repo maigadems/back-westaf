@@ -15,7 +15,17 @@ npm start                 # ou npm run dev
 
 Node.js 18 ou plus récent, MySQL 8 (ou MariaDB 10.5+).
 
-### Variables obligatoires
+### Variables
+
+**Aucune variable n'est à ajouter au `.env` déjà en place sur Hostinger.** La nouvelle version lit les
+variables de l'ancienne (`DB_*`, `PAYTECH_*`, `FRONTEND_URL`, `CORS_ORIGINS`, `ADMIN_TOKEN_SECRET`…) et :
+
+- génère elle-même la clé des sessions et les clés des notifications push au premier démarrage
+  (table `app_secrets`) si `JWT_SECRET` / `VAPID_*` sont absents ;
+- utilise par défaut `https://westafrecords.com` et l'URL Hostinger de l'API ;
+- crée le super admin et l'admin (Jeuss) par la migration `012_staff_accounts`.
+
+Les variables ci-dessous restent possibles mais facultatives :
 
 | Variable | Rôle |
 |---|---|
@@ -27,7 +37,8 @@ Node.js 18 ou plus récent, MySQL 8 (ou MariaDB 10.5+).
 
 ### Comptes initiaux
 
-Au premier démarrage, si aucun compte de ce rôle n'existe :
+Le super admin et l'admin (Jeuss) sont créés par la migration `012_staff_accounts` (empreinte du mot de
+passe uniquement ; changement obligatoire à la première connexion). Facultatif, si aucun compte de ce rôle n'existe :
 
 - `SUPER_ADMIN_EMAIL` / `SUPER_ADMIN_PASSWORD` → super administrateur ;
 - `ADMIN_EMAIL` / `ADMIN_PASSWORD` (+ `ADMIN_FIRST_NAME=Jeuss`) → administrateur (Jeuss).
@@ -183,10 +194,8 @@ par Meta sont ignorés (déduplication par identifiant de message).
 Chaque notification de l'équipe (nouvelle réservation, paiement, demande d'espèces, report…) et du client
 est aussi envoyée en notification push sur les appareils où la personne l'a autorisée.
 
-1. Générer une paire de clés **une seule fois** : `npx web-push generate-vapid-keys`.
-2. Renseigner `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` et `VAPID_SUBJECT=mailto:contact@westafrecords.com`
-   dans le `.env` du serveur, puis redémarrer. Ne changez plus ces clés : tous les abonnements seraient perdus.
-3. Paramètres → Intégrations affiche « Notifications push » en vert.
+Les clés sont générées automatiquement au premier démarrage et conservées en base (table `app_secrets`) :
+aucune variable à ajouter. Paramètres → Intégrations affiche « Notifications push » en vert.
 
 Les abonnements sont stockés dans `push_subscriptions` (migration 010) et supprimés automatiquement quand
 le navigateur les invalide. Le site doit être servi en **HTTPS**. Sur iPhone (iOS 16.4+), l'application doit
