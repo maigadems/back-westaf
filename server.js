@@ -73,7 +73,7 @@ app.get('/health', ah(async (_req, res) => {
   res.json({
     status: 'OK',
     timestamp: new Date().toISOString(),
-    integrations: { paytech: paytechConfigured(), whatsapp: whatsappConfigured(), smtp: smtpConfigured(), google: !!config.google.clientId }
+    integrations: { paytech: paytechConfigured(), paytechMode: config.paytech.env, whatsapp: whatsappConfigured(), smtp: smtpConfigured(), google: !!config.google.clientId }
   });
 }));
 

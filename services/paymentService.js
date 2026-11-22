@@ -60,6 +60,9 @@ export const startPaytechPayment = async (reservation, kind, amount, milestone =
   }
 };
 
+// Paiement réalisé en mode test chez PayTech : seul un petit montant aléatoire a été prélevé
+export const isTestModeIpn = (b) => String(b.env || '').toLowerCase() === 'test' && config.paytech.env === 'prod';
+
 // Authentification de l'IPN (logique identique à l'ancienne intégration)
 export const verifyIpn = (b) => {
   const { apiKey, apiSecret } = config.paytech;
@@ -90,6 +93,12 @@ export const handleIpn = async (b) => {
   }
   if (b.type_event !== 'sale_complete') return { handled: 'ignored' };
   if (payment.status === 'completed') return { handled: 'duplicate' };
+  if (isTestModeIpn(b)) {
+    await q("UPDATE payments SET status = 'failed' WHERE id = ? AND status = 'pending'", [payment.id]);
+    await logHistory(payment.reservation_id, null, 'payment_conflict', { amount: Number(b.item_price || b.final_item_price), reason: 'Paiement PayTech en mode test (petit montant prélevé) : non comptabilisé' });
+    console.error(`❌ IPN en mode test ignoré (${payment.ref_command}) : le montant réel n'a pas été prélevé`);
+    return { handled: 'test_mode_ignored' };
+  }
 
   const paidAmount = Number(b.item_price || b.final_item_price);
   if (paidAmount !== Number(payment.amount)) {
@@ -111,6 +120,7 @@ export const handleIpn = async (b) => {
 
 // --- Compatibilité : paiements lancés avant la mise en production de la nouvelle version ---
 const handleLegacyIpn = async (b) => {
+  if (isTestModeIpn(b)) { console.error('❌ IPN (ancienne version) en mode test ignoré'); return { handled: 'test_mode_ignored' }; }
   if (b.type_event !== 'sale_complete') return { handled: 'legacy_ignored' };
   let data = null;
   try { data = JSON.parse(b.custom_field); } catch {

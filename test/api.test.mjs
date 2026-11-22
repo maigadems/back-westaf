@@ -535,6 +535,26 @@ test('factures : téléchargement PDF (client, admin) et contrôle d’accès', 
   assert.equal((await get(`/admin/invoices/${inv.id}/pdf`, state.client)).status, 403);
 });
 
+test('PayTech en mode test : demande en mode réel, confirmation de test jamais comptée comme payée', async () => {
+  const day = futureDay(13);
+  const svc = (await api('GET', '/public/services')).data.services.find((s) => s.slug === 'enregistrement-studio');
+  const r = await api('POST', '/client/reservations', { token: state.client, body: { service_id: svc.id, start: `${day} 10:00`, hours: 1, payment_option: 'full' } });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  const req = sent.paytech[sent.paytech.length - 1];
+  assert.equal(req.env, 'prod', 'le prélèvement demandé est réel');
+  assert.equal(req.item_price, r.data.amountNow, 'le vrai montant est envoyé');
+  const key = process.env.PAYTECH_API_KEY, secret = process.env.PAYTECH_API_SECRET;
+  const hmac = crypto.createHmac('sha256', secret).update(`${req.item_price}|${req.ref_command}|${key}`).digest('hex');
+  const res = await api('POST', '/ipn', { body: { type_event: 'sale_complete', env: 'test', ref_command: req.ref_command, item_price: req.item_price, payment_method: 'Wave', hmac_compute: hmac } });
+  assert.equal(res.status, 200);
+  const [[p]] = await pool.query('SELECT status FROM payments WHERE ref_command = ?', [req.ref_command]);
+  assert.equal(p.status, 'failed', 'paiement test non comptabilisé');
+  const [[row]] = await pool.query('SELECT montant_paye, statut FROM reservations WHERE id = ?', [r.data.reservation.id]);
+  assert.equal(Number(row.montant_paye), 0, 'rien n’est marqué payé');
+  assert.notEqual(row.statut, 'confirmee');
+  await api('POST', `/client/reservations/${r.data.reservation.id}/cancel`, { token: state.client });
+});
+
 test('session de plusieurs heures : créneaux, blocage complet, facture', async () => {
   const day = futureDay(11);
   const svc = (await api('GET', '/public/services')).data.services.find((s) => s.slug === 'enregistrement-studio');

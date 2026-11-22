@@ -45,7 +45,10 @@ export const config = {
     baseUrl: process.env.PAYTECH_BASE_URL || 'https://paytech.sn/api',
     apiKey: process.env.PAYTECH_API_KEY || '',
     apiSecret: process.env.PAYTECH_API_SECRET || '',
-    env: process.env.PAYTECH_ENV || 'prod',
+    // Production : toujours « prod » (en mode test, PayTech ne prélève qu'un petit montant aléatoire ~100–150 FCFA).
+    // PAYTECH_ENV n'est pris en compte que pour les tests automatiques.
+    env: process.env.NODE_ENV === 'test' ? (process.env.PAYTECH_ENV || 'prod') : 'prod',
+    configuredEnv: process.env.PAYTECH_ENV || '',
     ipnUrl: real(process.env.PAYTECH_IPN_URL),
     refundNotifUrl: process.env.PAYTECH_REFUND_NOTIF_URL || '',
     currency: process.env.CURRENCY || 'XOF'
