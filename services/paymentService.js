@@ -104,6 +104,10 @@ export const handleIpn = async (b) => {
   if (paidAmount !== Number(payment.amount)) {
     console.error(`❌ IPN : montant ${paidAmount} ≠ attendu ${payment.amount} (${payment.ref_command})`);
     await logHistory(payment.reservation_id, null, 'payment_conflict', { amount: paidAmount, expected: payment.amount, reason: 'Montant IPN inattendu' });
+      if (paidAmount < Number(payment.amount)) {
+    await q("UPDATE payments SET status = 'failed' WHERE id = ? AND status = 'pending'", [payment.id]);
+    return { handled: 'amount_mismatch' };
+  }
   }
   const [upd] = await pool.query(
     "UPDATE payments SET status = 'completed', completed_at = UTC_TIMESTAMP(), provider_method = ? WHERE id = ? AND status <> 'completed'",
